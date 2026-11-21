@@ -1,14 +1,18 @@
-# Python requirements for ClipForge Custom LLM server
+# Python requirements for ClipForge
+#
+# Base runtime:
+# - custom_llm/server.py runs using only the Python 3 standard library.
+# - yt-dlp is auto-bootstrapped as a standalone zipapp into workspace/bin/yt-dlp
+#   if not installed globally on PATH, or you can install it via pip below.
 
-# Base runtime: custom_llm/server.py works with Python 3 standard library only.
-# These packages are optional and only needed for advanced backends / fine-tuning.
+# Optional global yt-dlp install (stream extractor for YouTube/Twitch/Kick VODs):
+# yt-dlp>=2026.1.1
 
-# llama.cpp GGUF inference (CUDA offload to GTX 1650, 4 GB VRAM)
-# NOTE: requires C++ build tools (Visual Studio Build Tools) to compile from source on Windows.
-# Optional — server.py works without it via the built-in trainable classifier or Ollama.
+# Optional llama.cpp GGUF inference (CUDA offload to GTX 1650, 4 GB VRAM)
+# NOTE: requires C++ build tools to compile from source on Windows.
 # llama-cpp-python>=0.3.0
 
-# 4-bit QLoRA fine-tuning on 4 GB VRAM GPUs
+# Optional 4-bit QLoRA fine-tuning on 4 GB VRAM GPUs (custom_llm/finetune_lora.py):
 torch>=2.3.0
 transformers>=4.44.0
 datasets>=2.20.0

@@ -29,3 +29,8 @@ ollama create clipforge-viral:3b -f custom_llm/Modelfile
 ```bash
 python3 custom_llm/finetune_lora.py
 ```
+
+## Notes
+- `server.py` formats multi-hour timestamps cleanly (`HH:MM:SS` for `>= 1h` VODs).
+- Bind host/port can be customized via `CUSTOM_LLM_BIND_HOST` (default `127.0.0.1`) and `CUSTOM_LLM_PORT` (default `8000`).
+
