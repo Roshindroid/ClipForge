@@ -507,3 +507,114 @@ export async function downloadSegmentWithYtDlp(
     120000
   );
 }
+
+/**
+ * Downloads the full video in up to 1080p MP4 to targetPath using yt-dlp with
+ * live progress parsing and a stall-only timeout (so long/multi-GB VODs never abort prematurely).
+ */
+export async function downloadVideo1080pWithYtDlp(
+  url: string,
+  targetPath: string,
+  platform: string,
+  onProgress?: (pct: number, detail: string) => void
+): Promise<void> {
+  const bin = await ensureYtDlp();
+  const baseArgs = getYtDlpBaseArgs();
+  const parentDir = path.dirname(targetPath);
+  if (!fs.existsSync(parentDir)) {
+    fs.mkdirSync(parentDir, { recursive: true });
+  }
+
+  const args = [
+    ...baseArgs,
+    '--newline',
+    '--progress',
+    '-S',
+    'res:1080,ext:mp4:m4a',
+    '-f',
+    'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b',
+    '--merge-output-format',
+    'mp4',
+    '-o',
+    targetPath,
+    url,
+  ];
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(bin, args, { shell: false });
+    let stderr = '';
+    let lineBuf = '';
+    let settled = false;
+    const STALL_TIMEOUT_MS = 180_000;
+
+    let stallTimer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        child.kill('SIGTERM');
+        setTimeout(() => child.kill('SIGKILL'), 2000);
+        reject(new Error('1080p download stalled with no progress for 180s.'));
+      }
+    }, STALL_TIMEOUT_MS);
+
+    const resetStall = () => {
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          child.kill('SIGTERM');
+          setTimeout(() => child.kill('SIGKILL'), 2000);
+          reject(new Error('1080p download stalled with no progress for 180s.'));
+        }
+      }, STALL_TIMEOUT_MS);
+    };
+
+    const handleChunk = (text: string) => {
+      resetStall();
+      lineBuf += text;
+      const lines = lineBuf.split(/[\r\n]+/);
+      lineBuf = lines.pop() || '';
+      for (const line of lines) {
+        const m = line.match(/\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+([^\s]+)(?:\s+at\s+([^\s]+))?/i);
+        if (m && onProgress) {
+          const pct = Math.min(100, Math.max(0, Number(m[1])));
+          const sizeStr = m[2] || '';
+          const speedStr = m[3] ? ` · ${m[3]}` : '';
+          onProgress(pct, `${pct.toFixed(1)}% of ${sizeStr}${speedStr}`);
+        } else if (/\[Merger\]|Merging formats/i.test(line) && onProgress) {
+          onProgress(98, 'Muxing 1080p video + audio into MP4...');
+        }
+      }
+    };
+
+    child.stdout.on('data', (chunk) => handleChunk(String(chunk)));
+    child.stderr.on('data', (chunk) => {
+      const s = String(chunk);
+      if (stderr.length < 512 * 1024) stderr += s;
+      handleChunk(s);
+    });
+
+    child.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(stallTimer);
+        reject(err);
+      }
+    });
+
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(stallTimer);
+      if (code === 0 && fs.existsSync(targetPath)) {
+        resolve();
+      } else {
+        reject(
+          formatYtDlpError(
+            stderr.trim() || `${path.basename(bin)} exited with code ${code}`,
+            platform
+          )
+        );
+      }
+    });
+  });
+}

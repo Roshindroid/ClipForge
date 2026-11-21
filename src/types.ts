@@ -73,11 +73,14 @@ export interface HeatmapPoint {
   value: number;
 }
 
+export type IngestStrategy = 'download-1080p' | 'remote-stream';
+
 export interface VideoProject {
   id: string;
   title: string;
   sourceType: PlatformType;
   sourceMode?: 'local' | 'remote-stream';
+  downloadFolder?: string;
   sourceUrl?: string;
   fileName: string;
   sourceSizeBytes?: number;
@@ -96,6 +99,18 @@ export interface VideoProject {
   heatmapPeaks?: HeatmapPoint[];
   transcriptText?: string;
   createdAt: string;
+}
+
+export interface StorageStatus {
+  sourcesDir: string;
+  rendersDir: string;
+  totalSourceBytes: number;
+  totalRenderBytes: number;
+  activeVodCount: number;
+}
+
+export interface AppSettings {
+  autoPruneSourceVod: boolean;
 }
 
 export interface RenderedClip {
@@ -200,6 +215,9 @@ export interface JobStatus {
   stage: string;
   detail?: string;
   error?: string;
+  projectId?: string;
+  momentId?: string;
+  autoPruned?: boolean;
   project?: VideoProject;
   clip?: RenderedClip;
   createdAt: string;

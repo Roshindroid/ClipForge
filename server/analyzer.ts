@@ -13,7 +13,13 @@ import type {
   ViralMoment,
 } from '../src/types.ts';
 import { scoreMomentsWithRouter } from './llmRouter.ts';
-import { FRAMES_DIR, SOURCES_DIR, ensureWorkspace, resolveSafeChildPath } from './storage.ts';
+import {
+  FRAMES_DIR,
+  SOURCES_DIR,
+  ensureWorkspace,
+  resolveSafeChildPath,
+  resolveSafeSourcePath,
+} from './storage.ts';
 import { computeFinalRankScore } from './weights.ts';
 import type { ResolvedStreamUrls } from './ytdlp.ts';
 
@@ -919,6 +925,7 @@ export async function analyzeVideoProject(params: {
   title: string;
   sourceType: PlatformType;
   sourceMode?: 'local' | 'remote-stream';
+  downloadFolder?: string;
   sourceUrl?: string;
   streamUrls?: ResolvedStreamUrls;
   preProbed?: ProbeResult;
@@ -930,7 +937,7 @@ export async function analyzeVideoProject(params: {
 }): Promise<VideoProject> {
   const sourceMode = params.sourceMode || 'local';
   const localPath =
-    sourceMode === 'local' ? resolveSafeChildPath(SOURCES_DIR, params.fileName) : '';
+    sourceMode === 'local' ? resolveSafeSourcePath(params.fileName) : '';
   const sourceSizeBytes =
     sourceMode === 'local' && localPath && fs.existsSync(localPath)
       ? fs.statSync(localPath).size
@@ -982,6 +989,7 @@ export async function analyzeVideoProject(params: {
     title: params.title,
     sourceType: params.sourceType,
     sourceMode,
+    downloadFolder: params.downloadFolder || undefined,
     sourceUrl: params.sourceUrl,
     fileName: params.fileName,
     sourceSizeBytes,

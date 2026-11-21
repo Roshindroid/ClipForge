@@ -9,8 +9,10 @@ import type {
   BrandingConfig,
   CreatorWatchItem,
   FacecamBox,
+  IngestStrategy,
   LayoutId,
   TemplateId,
+  VideoProject,
   ViralMoment,
 } from './src/types.ts';
 import { analyzeVideoProject, findViralMoments } from './server/analyzer.ts';
@@ -21,7 +23,15 @@ import {
   stopLocalCustomLlm,
 } from './server/customLlmManager.ts';
 import { generateSampleStreamVideo, ingestFromUrl } from './server/ingest.ts';
-import { completeJob, createJob, failJob, getJob, updateJob } from './server/jobs.ts';
+import {
+  canAutoPruneProject,
+  completeJob,
+  createJob,
+  enqueueRenderTask,
+  failJob,
+  getJob,
+  updateJob,
+} from './server/jobs.ts';
 import {
   clearRouterCooldowns,
   getLLMRouterState,
@@ -37,16 +47,22 @@ import {
   FRAMES_DIR,
   RENDERS_DIR,
   SOURCES_DIR,
+  cleanupProjectSource,
   deleteClip,
   deleteProject,
   ensureWorkspace,
   getClip,
   getProject,
+  getStorageStatus,
   listClips,
   listProjects,
   listWatchlist,
+  loadAppSettings,
   loadWeights,
+  pruneAllDownloadedSources,
   resolveSafeChildPath,
+  resolveSafeSourcePath,
+  saveAppSettings,
   saveClip,
   saveProject,
   saveWatchlist,
@@ -201,17 +217,30 @@ async function startServer() {
     const titleOverride = typeof req.body?.title === 'string' ? req.body.title.trim() : undefined;
     const transcriptText =
       typeof req.body?.transcriptText === 'string' ? req.body.transcriptText : undefined;
+    const ingestStrategy: IngestStrategy =
+      req.body?.ingestStrategy === 'remote-stream' ? 'remote-stream' : 'download-1080p';
+    const downloadFolder =
+      typeof req.body?.downloadFolder === 'string' ? req.body.downloadFolder.trim() : undefined;
 
     if (!rawUrl) {
       return res.status(400).json({ error: 'Video URL is required.' });
     }
 
-    const job = createJob('ingest-url', 'Connecting to remote stream...', rawUrl.slice(0, 80));
+    const job = createJob(
+      'ingest-url',
+      ingestStrategy === 'download-1080p'
+        ? 'Preparing 1080p download to folder...'
+        : 'Connecting to remote stream...',
+      rawUrl.slice(0, 80)
+    );
 
     (async () => {
       try {
-        const ingested = await ingestFromUrl(rawUrl, titleOverride, (pct, stage, detail) =>
-          updateJob(job.id, { progress: pct, stage, detail })
+        const ingested = await ingestFromUrl(
+          rawUrl,
+          titleOverride,
+          (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
+          { ingestStrategy, downloadFolder }
         );
         const weights = loadWeights();
         const project = await analyzeVideoProject({
@@ -219,6 +248,7 @@ async function startServer() {
           title: ingested.title,
           sourceType: ingested.platform,
           sourceMode: ingested.sourceMode,
+          downloadFolder: ingested.downloadFolder,
           sourceUrl: rawUrl,
           streamUrls: ingested.streamUrls,
           preProbed: ingested.preProbed,
@@ -226,7 +256,13 @@ async function startServer() {
           heatmap: ingested.heatmap,
           transcriptText,
           weights,
-          onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
+          onProgress: (pct, stage, detail) => {
+            const mappedPct =
+              ingested.sourceMode === 'local'
+                ? Math.min(99, Math.round(52 + ((Math.max(24, pct) - 24) / 72) * 46))
+                : pct;
+            updateJob(job.id, { progress: mappedPct, stage, detail });
+          },
         });
         saveProject(project);
         completeJob(job.id, { project });
@@ -444,27 +480,31 @@ async function startServer() {
     res.json({ project: updated, weights, trainingStats });
   });
 
-  app.post('/api/projects/:id/cleanup-source', (req, res) => {
-    const project = getProject(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Project not found' });
+  app.get('/api/storage/status', (_req, res) => {
+    res.json(getStorageStatus());
+  });
 
-    if (project.sourceMode !== 'remote-stream') {
-      try {
-        const srcPath = resolveSafeChildPath(SOURCES_DIR, project.fileName);
-        if (fs.existsSync(srcPath)) {
-          fs.unlinkSync(srcPath);
-        }
-      } catch {
-        return res.status(400).json({ error: 'Could not clean up source file safely.' });
-      }
-    }
-
-    const updated = saveProject({
-      ...project,
-      sourceDeleted: true,
-      sourceSizeBytes: 0,
+  app.post('/api/storage/prune-sources', (_req, res) => {
+    const { projects, freedBytes } = pruneAllDownloadedSources();
+    res.json({
+      projects,
+      freedBytes,
+      storage: getStorageStatus(),
     });
-    res.json({ project: updated });
+  });
+
+  app.post('/api/projects/:id/cleanup-source', (req, res) => {
+    try {
+      const result = cleanupProjectSource(req.params.id);
+      if (!result.project) return res.status(404).json({ error: 'Project not found' });
+      res.json({
+        project: result.project,
+        freedBytes: result.freedBytes,
+        storage: getStorageStatus(),
+      });
+    } catch {
+      res.status(400).json({ error: 'Could not clean up source file safely.' });
+    }
   });
 
   app.delete('/api/projects/:id', (req, res) => {
@@ -533,9 +573,95 @@ async function startServer() {
     res.json({ weights: resetRankingWeights() });
   });
 
+  app.get('/api/settings', (_req, res) => {
+    res.json({ settings: loadAppSettings() });
+  });
+
+  app.post('/api/settings', (req, res) => {
+    const settings = saveAppSettings({
+      autoPruneSourceVod:
+        typeof req.body?.autoPruneSourceVod === 'boolean'
+          ? req.body.autoPruneSourceVod
+          : undefined,
+    });
+    res.json({ settings });
+  });
+
+  app.patch('/api/settings', (req, res) => {
+    const settings = saveAppSettings({
+      autoPruneSourceVod:
+        typeof req.body?.autoPruneSourceVod === 'boolean'
+          ? req.body.autoPruneSourceVod
+          : undefined,
+    });
+    res.json({ settings });
+  });
+
   app.get('/api/clips', (_req, res) => {
     res.json({ clips: listClips() });
   });
+
+  const queueClipRenderJob = (params: {
+    project: VideoProject;
+    moment: ViralMoment;
+    layoutId: LayoutId;
+    templateId: TemplateId;
+    facecamBox: FacecamBox;
+    branding: BrandingConfig;
+    titleOverride?: string;
+    hookTaglineOverride?: string;
+    descriptionOverride?: string;
+    hashtagsOverride?: string[];
+  }) => {
+    const job = createJob('render', 'Queued for 9:16 FFmpeg render...', params.moment.title, {
+      status: 'queued',
+      projectId: params.project.id,
+      momentId: params.moment.id,
+    });
+
+    enqueueRenderTask(async () => {
+      updateJob(job.id, { status: 'running', progress: 5, stage: 'Starting 9:16 FFmpeg render...' });
+      try {
+        const latestProject = getProject(params.project.id) || params.project;
+        const clip = await renderVerticalClip({
+          project: latestProject,
+          moment: params.moment,
+          layoutId: params.layoutId,
+          templateId: params.templateId,
+          facecamBox: params.facecamBox,
+          branding: params.branding,
+          titleOverride: params.titleOverride,
+          hookTaglineOverride: params.hookTaglineOverride,
+          descriptionOverride: params.descriptionOverride,
+          hashtagsOverride: params.hashtagsOverride,
+          onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
+        });
+        saveClip(clip);
+
+        let autoPruned = false;
+        let updatedProject: VideoProject | undefined;
+        const settings = loadAppSettings();
+        if (
+          settings.autoPruneSourceVod &&
+          latestProject.sourceMode !== 'remote-stream' &&
+          !latestProject.sourceDeleted &&
+          canAutoPruneProject(latestProject.id, job.id)
+        ) {
+          const pruned = cleanupProjectSource(latestProject.id);
+          if (pruned.project) {
+            autoPruned = true;
+            updatedProject = pruned.project;
+          }
+        }
+
+        completeJob(job.id, { clip, project: updatedProject, autoPruned });
+      } catch (err) {
+        failJob(job.id, err instanceof Error ? err.message : 'FFmpeg render failed');
+      }
+    });
+
+    return job;
+  };
 
   app.post('/api/clips/render', (req, res) => {
     const projectId = String(req.body?.projectId || '');
@@ -560,33 +686,70 @@ async function startServer() {
       musicTrackId: req.body?.branding?.musicTrackId || null,
     };
 
-    const job = createJob('render', 'Starting 9:16 FFmpeg render...', moment.title);
-
-    (async () => {
-      try {
-        const clip = await renderVerticalClip({
-          project,
-          moment,
-          layoutId,
-          templateId,
-          facecamBox,
-          branding,
-          titleOverride: typeof req.body?.title === 'string' ? req.body.title : undefined,
-          hookTaglineOverride:
-            typeof req.body?.hookTagline === 'string' ? req.body.hookTagline : undefined,
-          descriptionOverride:
-            typeof req.body?.description === 'string' ? req.body.description : undefined,
-          hashtagsOverride: Array.isArray(req.body?.hashtags) ? req.body.hashtags : undefined,
-          onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
-        });
-        saveClip(clip);
-        completeJob(job.id, { clip });
-      } catch (err) {
-        failJob(job.id, err instanceof Error ? err.message : 'FFmpeg render failed');
-      }
-    })();
+    const job = queueClipRenderJob({
+      project,
+      moment,
+      layoutId,
+      templateId,
+      facecamBox,
+      branding,
+      titleOverride: typeof req.body?.title === 'string' ? req.body.title : undefined,
+      hookTaglineOverride:
+        typeof req.body?.hookTagline === 'string' ? req.body.hookTagline : undefined,
+      descriptionOverride:
+        typeof req.body?.description === 'string' ? req.body.description : undefined,
+      hashtagsOverride: Array.isArray(req.body?.hashtags) ? req.body.hashtags : undefined,
+    });
 
     res.status(202).json({ jobId: job.id, job });
+  });
+
+  app.post('/api/clips/render-batch', (req, res) => {
+    const projectId = String(req.body?.projectId || '');
+    const layoutId = (req.body?.layoutId || 'split-top-cam') as LayoutId;
+    const templateId = (req.body?.templateId || 'none') as TemplateId;
+
+    const project = getProject(projectId);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    const requestedIds = Array.isArray(req.body?.momentIds)
+      ? (req.body.momentIds as string[])
+      : null;
+    const targetMoments =
+      requestedIds && requestedIds.length > 0
+        ? project.moments.filter((m) => requestedIds.includes(m.id))
+        : project.moments;
+
+    if (targetMoments.length === 0) {
+      return res.status(400).json({ error: 'No moments found to queue for rendering.' });
+    }
+
+    const facecamBox = (req.body?.facecamBox as FacecamBox) || project.detectedFacecam;
+    const branding: BrandingConfig = {
+      creditText: String(req.body?.branding?.creditText || '@clipforge').slice(0, 40),
+      backgroundHex: String(req.body?.branding?.backgroundHex || '#0B0D11').slice(0, 12),
+      watermarkText: String(req.body?.branding?.watermarkText || '').slice(0, 40),
+      outroEnabled: Boolean(req.body?.branding?.outroEnabled),
+      outroSeconds: Number(req.body?.branding?.outroSeconds || 1.5),
+      musicVolume: Number(req.body?.branding?.musicVolume ?? 0),
+      musicTrackId: req.body?.branding?.musicTrackId || null,
+    };
+
+    const jobs = targetMoments.map((moment) =>
+      queueClipRenderJob({
+        project,
+        moment,
+        layoutId,
+        templateId,
+        facecamBox,
+        branding,
+      })
+    );
+
+    res.status(202).json({
+      jobIds: jobs.map((j) => j.id),
+      jobs,
+    });
   });
 
   app.patch('/api/clips/:id', (req, res) => {
@@ -673,9 +836,10 @@ async function startServer() {
     }
   });
 
-  app.get('/api/sources/:filename', (req, res) => {
+  app.get('/api/sources/*', (req, res) => {
     try {
-      const target = resolveSafeChildPath(SOURCES_DIR, req.params.filename);
+      const wildcardPath = String((req.params as Record<string, string>)[0] || '');
+      const target = resolveSafeSourcePath(wildcardPath);
       if (!fs.existsSync(target)) return res.status(404).end();
       res.sendFile(target);
     } catch {

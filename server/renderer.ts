@@ -15,9 +15,9 @@ import { detectNvencSupport } from './capabilities.ts';
 import {
   FRAMES_DIR,
   RENDERS_DIR,
-  SOURCES_DIR,
   ensureWorkspace,
   resolveSafeChildPath,
+  resolveSafeSourcePath,
 } from './storage.ts';
 import { downloadSegmentWithYtDlp, resolveStreamUrlsWithYtDlp } from './ytdlp.ts';
 
@@ -240,11 +240,20 @@ async function resolveProjectSourceInputs(project: VideoProject): Promise<{
   isSeparate: boolean;
   isRemote: boolean;
 }> {
+  if (project.sourceDeleted) {
+    throw new Error(
+      'Source VOD was deleted from the folder to save storage. View your rendered Shorts in Render Queue or re-ingest the link to render more clips.'
+    );
+  }
+
   if (project.sourceMode !== 'remote-stream') {
-    const srcPath = resolveSafeChildPath(SOURCES_DIR, project.fileName);
+    const srcPath = resolveSafeSourcePath(project.fileName);
     if (fs.existsSync(srcPath)) {
       return { videoUrl: srcPath, audioUrl: srcPath, isSeparate: false, isRemote: false };
     }
+    throw new Error(
+      'Source VOD file was removed from workspace/sources. Re-ingest the source if you want to render additional clips.'
+    );
   }
 
   if (!project.sourceUrl) {

@@ -8,6 +8,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import type {
+  AppSettings,
   BrandingConfig,
   FacecamBox,
   LayoutId,
@@ -23,9 +24,11 @@ import { LayoutThumbnail } from './LayoutThumbnail';
 interface FacecamLayoutStudioProps {
   project: VideoProject | null;
   moment: ViralMoment | null;
+  appSettings: AppSettings;
   onSelectMoment: (moment: ViralMoment) => void;
   onProjectUpdated: (project: VideoProject) => void;
-  onClipRendered: (clip: RenderedClip) => void;
+  onClipRendered: (clip: RenderedClip, updatedProject?: VideoProject) => void;
+  onBatchClipsRendered?: (clips: RenderedClip[], updatedProject?: VideoProject) => void;
 }
 
 const TEMPLATES: Array<{ id: TemplateId; label: string; desc: string }> = [
@@ -38,9 +41,11 @@ const TEMPLATES: Array<{ id: TemplateId; label: string; desc: string }> = [
 export function FacecamLayoutStudio({
   project,
   moment,
+  appSettings,
   onSelectMoment,
   onProjectUpdated,
   onClipRendered,
+  onBatchClipsRendered,
 }: FacecamLayoutStudioProps) {
   const activeMoment = moment || project?.moments[0] || null;
   const [frameIndex, setFrameIndex] = useState(0);
@@ -183,18 +188,71 @@ export function FacecamLayoutStudio({
       if (!res.ok) throw new Error(data.error || 'FFmpeg render failed');
 
       let renderedClip = data.clip;
+      let updatedProject = data.project as VideoProject | undefined;
       if (data.jobId) {
         const done = await pollJobUntilDone(data.jobId, (job) => {
           setRenderProgress(job.progress);
           setRenderStage(job.stage);
         });
         renderedClip = done.clip;
+        if (done.project) updatedProject = done.project;
       }
 
       if (!renderedClip) throw new Error('Render finished without output clip.');
-      onClipRendered(renderedClip);
+      onClipRendered(renderedClip, updatedProject);
     } catch (err) {
       setRenderError(err instanceof Error ? err.message : 'FFmpeg render failed');
+    } finally {
+      setIsRendering(false);
+      setRenderStage('');
+      setRenderProgress(0);
+    }
+  };
+
+  const handleRenderAllClips = async () => {
+    if (!project || project.moments.length === 0) return;
+    setIsRendering(true);
+    setRenderError(null);
+    setRenderStage(`Queueing ${project.moments.length} clips...`);
+    setRenderProgress(4);
+
+    try {
+      const res = await fetch('/api/clips/render-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectId: project.id,
+          momentIds: project.moments.map((m) => m.id),
+          layoutId,
+          templateId,
+          facecamBox,
+          branding,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Batch render failed');
+
+      const jobIds: string[] = data.jobIds || [];
+      const renderedClips: RenderedClip[] = [];
+      let updatedProject: VideoProject | undefined;
+
+      for (let i = 0; i < jobIds.length; i++) {
+        const done = await pollJobUntilDone(jobIds[i], (job) => {
+          const overall = Math.round(((i + job.progress / 100) / jobIds.length) * 100);
+          setRenderProgress(overall);
+          setRenderStage(`Clip ${i + 1}/${jobIds.length}: ${job.stage}`);
+        });
+        if (done.clip) renderedClips.push(done.clip);
+        if (done.project) updatedProject = done.project;
+      }
+
+      if (onBatchClipsRendered) {
+        onBatchClipsRendered(renderedClips, updatedProject);
+      } else if (renderedClips[0]) {
+        onClipRendered(renderedClips[0], updatedProject);
+      }
+    } catch (err) {
+      setRenderError(err instanceof Error ? err.message : 'Batch render failed');
     } finally {
       setIsRendering(false);
       setRenderStage('');
@@ -242,6 +300,12 @@ export function FacecamLayoutStudio({
           <span>No Burned Captions — YouTube Auto-Captions Mode Active</span>
         </div>
       </div>
+
+      {project.sourceDeleted && (
+        <div className="px-4 py-3 text-xs text-amber-200 bg-amber-950/40 border border-amber-700/60 rounded-xl">
+          This project’s source VOD was deleted from <span className="font-mono">workspace/sources</span> to save disk space. Already-rendered Shorts remain in Render Queue; re-ingest the link if you want to render new clips.
+        </div>
+      )}
 
       {/* Main 3-Column Facecam & Layout Studio */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
@@ -657,28 +721,49 @@ export function FacecamLayoutStudio({
             </div>
           )}
 
-          <button
-            type="button"
-            onClick={handleRenderClip}
-            disabled={isRendering || Boolean(project.sourceDeleted)}
-            className="w-full py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white text-sm font-semibold rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-          >
-            {isRendering ? (
-              <>
-                <Sparkles className="w-4 h-4 animate-spin" />
-                {renderStage || 'Rendering 9:16 MP4 via FFmpeg...'} ({renderProgress}%)
-              </>
-            ) : (
-              <>
-                <Film className="w-4 h-4" />
-                Render 9:16 Vertical Short ({activeMoment.durationSec}s)
-              </>
-            )}
-          </button>
+          <div className="flex flex-col sm:flex-row gap-2.5">
+            <button
+              type="button"
+              onClick={handleRenderClip}
+              disabled={isRendering || Boolean(project.sourceDeleted)}
+              className="flex-1 py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white text-sm font-semibold rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+            >
+              {isRendering ? (
+                <>
+                  <Sparkles className="w-4 h-4 animate-spin" />
+                  {renderStage || 'Rendering 9:16 MP4 via FFmpeg...'} ({renderProgress}%)
+                </>
+              ) : (
+                <>
+                  <Film className="w-4 h-4" />
+                  Render Short ({activeMoment.durationSec}s)
+                </>
+              )}
+            </button>
 
-          <div className="flex items-center justify-center gap-2 text-[11px] text-[#94A3B8]">
-            <Check className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Output: 720×1280 H.264 MP4 · Burned Captions: OFF</span>
+            {project.moments.length > 1 && (
+              <button
+                type="button"
+                onClick={handleRenderAllClips}
+                disabled={isRendering || Boolean(project.sourceDeleted)}
+                className="px-4 py-3 bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] text-[#F4F5F7] text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-50"
+              >
+                <Layers className="w-3.5 h-3.5 text-rose-400" />
+                Queue All {project.moments.length} Clips
+              </button>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center justify-center gap-3 text-[11px] text-[#94A3B8]">
+            <span className="inline-flex items-center gap-1.5">
+              <Check className="w-3.5 h-3.5 text-emerald-400" />
+              Output: 720×1280 H.264 MP4 · Burned Captions: OFF
+            </span>
+            {appSettings.autoPruneSourceVod && project.sourceMode !== 'remote-stream' && !project.sourceDeleted && (
+              <span className="font-mono text-emerald-400">
+                · Auto-Prune VOD ON
+              </span>
+            )}
           </div>
         </section>
       </div>

@@ -1,26 +1,33 @@
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { HeatmapPoint, PlatformType, VideoChapter } from '../src/types.ts';
-import { SOURCES_DIR, ensureWorkspace, resolveSafeChildPath } from './storage.ts';
+import type { HeatmapPoint, IngestStrategy, PlatformType, VideoChapter } from '../src/types.ts';
 import {
+  SOURCES_DIR,
+  ensureWorkspace,
+  resolveSafeChildPath,
+  resolveSafeSourcePath,
+  sanitizeFileSlug,
+  sanitizeFolderName,
+} from './storage.ts';
+import {
+  downloadVideo1080pWithYtDlp,
   ensureYtDlp,
   fetchMetadataWithYtDlp,
-  getYtDlpBaseArgs,
   resolveStreamUrlsWithYtDlp,
-  runProcessWithTimeout,
   type ResolvedStreamUrls,
 } from './ytdlp.ts';
 
 const execFileAsync = promisify(execFile);
 
-const LOCAL_DOWNLOAD_MAX_DURATION_SEC = 420; // <= 7 min downloads locally; > 7 min (up to 50+ hours) streams on-demand
-const LOCAL_DOWNLOAD_MAX_BYTES = 450 * 1024 * 1024; // 450 MB cap for eager local download
+const LOCAL_DOWNLOAD_MAX_DURATION_SEC = 420;
+const LOCAL_DOWNLOAD_MAX_BYTES = 450 * 1024 * 1024;
 
 const ALLOWED_STREAM_HOSTS = [
   'youtube.com',
@@ -107,7 +114,6 @@ export function detectPlatformFromUrl(rawUrl: string): {
     return { parsedUrl, platform: 'direct', isDirectMediaExt: false };
   }
 
-  // Allow probing any public HTTPS video/CDN link (validated via HEAD/ffprobe in ingestFromUrl)
   return { parsedUrl, platform: 'direct', isDirectMediaExt: false };
 }
 
@@ -173,12 +179,22 @@ async function probeRemoteMediaUrl(url: string): Promise<{
   };
 }
 
-async function streamDirectMediaToFile(url: string, targetPath: string): Promise<void> {
+async function streamDirectMediaToFile(
+  url: string,
+  targetPath: string,
+  maxBytes?: number,
+  onProgress?: (pct: number, detail: string) => void
+): Promise<void> {
+  const parentDir = path.dirname(targetPath);
+  if (!fs.existsSync(parentDir)) {
+    fs.mkdirSync(parentDir, { recursive: true });
+  }
+
   const controller = new AbortController();
-  let stallTimer = setTimeout(() => controller.abort(), 45000);
+  let stallTimer = setTimeout(() => controller.abort(), 60000);
   const resetStall = () => {
     clearTimeout(stallTimer);
-    stallTimer = setTimeout(() => controller.abort(), 45000);
+    stallTimer = setTimeout(() => controller.abort(), 60000);
   };
 
   try {
@@ -187,16 +203,55 @@ async function streamDirectMediaToFile(url: string, targetPath: string): Promise
       throw new Error(`Failed to fetch direct media URL (HTTP ${res.status})`);
     }
     const contentLength = Number(res.headers.get('content-length') || 0);
-    if (contentLength > LOCAL_DOWNLOAD_MAX_BYTES) {
-      throw new Error('Remote video exceeds local eager-download cap; switching to remote-stream mode.');
+    if (maxBytes && contentLength > maxBytes) {
+      throw new Error('Remote video exceeds eager-download cap.');
     }
 
+    let downloaded = 0;
+    let lastReportAt = 0;
     const bodyStream = Readable.fromWeb(res.body as unknown as import('node:stream/web').ReadableStream);
-    bodyStream.on('data', resetStall);
+    bodyStream.on('data', (chunk: Buffer) => {
+      resetStall();
+      downloaded += chunk.length;
+      const now = Date.now();
+      if (onProgress && now - lastReportAt > 500) {
+        lastReportAt = now;
+        const mb = (downloaded / (1024 * 1024)).toFixed(1);
+        if (contentLength > 0) {
+          const pct = Math.min(100, (downloaded / contentLength) * 100);
+          const totalMb = (contentLength / (1024 * 1024)).toFixed(1);
+          onProgress(pct, `${mb} / ${totalMb} MB`);
+        } else {
+          onProgress(35, `${mb} MB downloaded`);
+        }
+      }
+    });
+
     await pipeline(bodyStream, fs.createWriteStream(targetPath));
   } finally {
     clearTimeout(stallTimer);
   }
+}
+
+function buildSourceFilePath(title: string, id: string, downloadFolder?: string): {
+  fileName: string;
+  targetPath: string;
+  folderLabel: string;
+} {
+  const cleanFolder = sanitizeFolderName(downloadFolder);
+  const slug = sanitizeFileSlug(title, 44);
+  const baseFile = `${slug}_${id}.mp4`;
+  const relativeFileName = cleanFolder ? `${cleanFolder}/${baseFile}` : baseFile;
+  const targetPath = resolveSafeSourcePath(relativeFileName);
+  const parentDir = path.dirname(targetPath);
+  if (!fs.existsSync(parentDir)) {
+    fs.mkdirSync(parentDir, { recursive: true });
+  }
+  return {
+    fileName: relativeFileName,
+    targetPath,
+    folderLabel: cleanFolder || '',
+  };
 }
 
 export interface IngestResult {
@@ -204,6 +259,7 @@ export interface IngestResult {
   title: string;
   platform: PlatformType;
   sourceMode: 'local' | 'remote-stream';
+  downloadFolder?: string;
   streamUrls?: ResolvedStreamUrls;
   preProbed?: {
     durationSec: number;
@@ -219,13 +275,17 @@ export interface IngestResult {
 export async function ingestFromUrl(
   rawUrl: string,
   titleOverride?: string,
-  onProgress?: (pct: number, stage: string, detail?: string) => void
+  onProgress?: (pct: number, stage: string, detail?: string) => void,
+  options?: {
+    ingestStrategy?: IngestStrategy;
+    downloadFolder?: string;
+  }
 ): Promise<IngestResult> {
   ensureWorkspace();
   const { parsedUrl, platform, isDirectMediaExt } = detectPlatformFromUrl(rawUrl);
-  const id = crypto.randomBytes(6).toString('hex');
-  const fileName = `src_${id}.mp4`;
-  const targetPath = resolveSafeChildPath(SOURCES_DIR, fileName);
+  const id = crypto.randomBytes(4).toString('hex');
+  const strategy: IngestStrategy = options?.ingestStrategy || 'download-1080p';
+  const cleanFolder = sanitizeFolderName(options?.downloadFolder);
 
   if (platform === 'direct') {
     onProgress?.(6, 'Probing remote video URL...', parsedUrl.hostname);
@@ -256,14 +316,43 @@ export async function ingestFromUrl(
       !contentType.includes('mpegurl') &&
       !contentType.includes('mp4')
     ) {
-      // Try yt-dlp as fallback if user pasted a generic video page URL
+      // Try yt-dlp fallback for generic video page URLs
       try {
         onProgress?.(10, 'Checking extractor compatibility...', parsedUrl.hostname);
         const meta = await fetchMetadataWithYtDlp(parsedUrl.toString(), 'direct');
+        const resolvedTitle = titleOverride?.trim() || meta.title;
+
+        if (strategy === 'download-1080p' && !meta.isLive) {
+          const { fileName, targetPath, folderLabel } = buildSourceFilePath(
+            resolvedTitle,
+            id,
+            cleanFolder
+          );
+          onProgress?.(14, 'Downloading 1080p video to folder...', folderLabel || 'workspace/sources');
+          await downloadVideo1080pWithYtDlp(
+            parsedUrl.toString(),
+            targetPath,
+            'direct',
+            (dlPct, detail) => {
+              const mapped = Math.round(14 + (dlPct / 100) * 36);
+              onProgress?.(mapped, 'Downloading 1080p video to folder...', detail);
+            }
+          );
+          return {
+            fileName,
+            title: resolvedTitle.slice(0, 120),
+            platform: 'direct',
+            sourceMode: 'local',
+            downloadFolder: folderLabel || undefined,
+            chapters: meta.chapters,
+            heatmap: meta.heatmap,
+          };
+        }
+
         const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
         return {
           fileName: `remote_${id}.mp4`,
-          title: titleOverride?.trim() || meta.title,
+          title: resolvedTitle.slice(0, 120),
           platform: 'direct',
           sourceMode: 'remote-stream',
           streamUrls,
@@ -277,7 +366,10 @@ export async function ingestFromUrl(
           chapters: meta.chapters,
           heatmap: meta.heatmap,
         };
-      } catch {
+      } catch (err) {
+        if (err instanceof Error && (err.message.includes('bot verification') || err.message.includes('cookies'))) {
+          throw err;
+        }
         throw new Error(
           'Unsupported URL host or non-video link. Use YouTube, Twitch, Kick, or a direct .mp4/.webm/.mov/.m3u8 media URL.'
         );
@@ -300,11 +392,11 @@ export async function ingestFromUrl(
       path.basename(parsedUrl.pathname, path.extname(parsedUrl.pathname)) ||
       `Direct Stream ${id}`;
 
-    // Long direct videos (including 50-hour MP4/HLS streams) stay in remote-stream mode — zero multi-GB download!
     if (
-      isHlsOrDash ||
-      probed.durationSec > LOCAL_DOWNLOAD_MAX_DURATION_SEC ||
-      contentLength > LOCAL_DOWNLOAD_MAX_BYTES
+      strategy === 'remote-stream' &&
+      (isHlsOrDash ||
+        probed.durationSec > LOCAL_DOWNLOAD_MAX_DURATION_SEC ||
+        contentLength > LOCAL_DOWNLOAD_MAX_BYTES)
     ) {
       onProgress?.(
         18,
@@ -326,30 +418,59 @@ export async function ingestFromUrl(
       };
     }
 
-    onProgress?.(12, 'Downloading short media file...', derivedTitle);
-    await streamDirectMediaToFile(parsedUrl.toString(), targetPath);
+    const { fileName, targetPath, folderLabel } = buildSourceFilePath(
+      derivedTitle,
+      id,
+      cleanFolder
+    );
+
+    if (isHlsOrDash) {
+      onProgress?.(14, 'Downloading 1080p stream to folder...', folderLabel || 'workspace/sources');
+      await downloadVideo1080pWithYtDlp(
+        parsedUrl.toString(),
+        targetPath,
+        'direct',
+        (dlPct, detail) => {
+          const mapped = Math.round(14 + (dlPct / 100) * 36);
+          onProgress?.(mapped, 'Downloading 1080p stream to folder...', detail);
+        }
+      );
+      return {
+        fileName,
+        title: derivedTitle.slice(0, 120),
+        platform,
+        sourceMode: 'local',
+        downloadFolder: folderLabel || undefined,
+      };
+    }
+
+    onProgress?.(14, 'Downloading video file to folder...', folderLabel || 'workspace/sources');
+    await streamDirectMediaToFile(parsedUrl.toString(), targetPath, undefined, (dlPct, detail) => {
+      const mapped = Math.round(14 + (dlPct / 100) * 36);
+      onProgress?.(mapped, 'Downloading video to folder...', detail);
+    });
     return {
       fileName,
       title: derivedTitle.slice(0, 120),
       platform,
       sourceMode: 'local',
+      downloadFolder: folderLabel || undefined,
       preProbed: probed,
     };
   }
 
   // Platform link (YouTube / Twitch / Kick): auto-bootstrap yt-dlp if missing
   onProgress?.(6, 'Preparing stream extractor (yt-dlp)...', platform.toUpperCase());
-  const bin = await ensureYtDlp();
+  await ensureYtDlp();
 
-  onProgress?.(12, `Fetching ${platform.toUpperCase()} metadata & heatmaps...`);
+  onProgress?.(10, `Fetching ${platform.toUpperCase()} metadata & heatmaps...`);
   const meta = await fetchMetadataWithYtDlp(parsedUrl.toString(), platform);
   const resolvedTitle = titleOverride?.trim() || meta.title;
 
-  // For videos > 7 min (including 10-hour or 50-hour VODs), stream directly on demand!
-  if (meta.durationSec > LOCAL_DOWNLOAD_MAX_DURATION_SEC || meta.isLive) {
+  if (strategy === 'remote-stream' || meta.isLive) {
     onProgress?.(
       20,
-      'Long-form stream ready for remote scanning',
+      'Stream indexed for remote scanning',
       `${(meta.durationSec / 3600).toFixed(1)}h · ${meta.width}x${meta.height}`
     );
     const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
@@ -371,58 +492,42 @@ export async function ingestFromUrl(
     };
   }
 
-  // Short platform clip (<= 7 min): download locally for instant scrubbing, fallback to remote-stream if download fails
-  onProgress?.(16, `Downloading ${platform.toUpperCase()} clip locally...`, resolvedTitle);
-  try {
-    const baseArgs = getYtDlpBaseArgs();
-    await runProcessWithTimeout(
-      bin,
-      [
-        ...baseArgs,
-        '-f',
-        'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b',
-        '--merge-output-format',
-        'mp4',
-        '-o',
-        targetPath,
-        parsedUrl.toString(),
-      ],
-      180000
-    );
+  // Default: Download 1080p MP4 directly into workspace/sources (or chosen subfolder) first,
+  // then analyze locally and let the user delete the downloaded VOD after generating Shorts!
+  const { fileName, targetPath, folderLabel } = buildSourceFilePath(
+    resolvedTitle,
+    id,
+    cleanFolder
+  );
 
-    if (fs.existsSync(targetPath)) {
-      return {
-        fileName,
-        title: resolvedTitle.slice(0, 120),
-        platform,
-        sourceMode: 'local',
-      };
-    }
-  } catch {
+  onProgress?.(
+    14,
+    `Downloading 1080p ${platform.toUpperCase()} VOD to folder...`,
+    folderLabel ? `workspace/sources/${folderLabel}` : 'workspace/sources'
+  );
+
+  try {
+    await downloadVideo1080pWithYtDlp(parsedUrl.toString(), targetPath, platform, (dlPct, detail) => {
+      const mapped = Math.round(14 + (dlPct / 100) * 36);
+      onProgress?.(mapped, 'Downloading 1080p VOD to folder...', detail);
+    });
+  } catch (err) {
     if (fs.existsSync(targetPath)) {
       try {
         fs.unlinkSync(targetPath);
       } catch {
-        // ignore
+        // ignore partial cleanup error
       }
     }
+    throw err;
   }
 
-  // Fallback to remote-stream mode if eager local download failed
-  const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
   return {
-    fileName: `remote_${id}.mp4`,
+    fileName,
     title: resolvedTitle.slice(0, 120),
     platform,
-    sourceMode: 'remote-stream',
-    streamUrls,
-    preProbed: {
-      durationSec: meta.durationSec,
-      width: meta.width,
-      height: meta.height,
-      fps: meta.fps,
-      hasAudio: meta.hasAudio,
-    },
+    sourceMode: 'local',
+    downloadFolder: folderLabel || undefined,
     chapters: meta.chapters,
     heatmap: meta.heatmap,
   };
@@ -443,8 +548,6 @@ export async function generateSampleStreamVideo(): Promise<{
   const fileName = `sample_stream_${id}.mp4`;
   const targetPath = resolveSafeChildPath(SOURCES_DIR, fileName);
 
-  // Create a 1280x720 gameplay background + distinct 300x200 bottom-right facecam feed
-  // Audio has baseline commentary plus loud reaction spikes at ~3.5s, ~9.5s, ~14.5s
   const filterComplex = [
     'testsrc2=size=1280x720:rate=30:duration=18[bg]',
     'mandelbrot=size=320x210:rate=30:maxiter=40,trim=duration=18,setpts=PTS-STARTPTS,drawbox=x=0:y=0:w=320:h=210:color=0xE11D48@0.9:t=4[cam]',

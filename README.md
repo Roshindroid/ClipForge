@@ -4,10 +4,11 @@ ClipForge extracts viral moments from short clips or 50-hour+ streams/VODs via a
 
 ## Features
 
-- **Ingest (Up to 50-Hour+ Streams & 100 GB Local Files)**:
+- **Ingest (1080p Folder-First Download & 50-Hour+ Remote Streams)**:
   - Local MP4/MOV/MKV/WebM uploads (up to 100 GB via disk streaming)
   - YouTube, Twitch, Kick URLs (auto-bootstraps standalone `yt-dlp` into `workspace/bin/yt-dlp` if not on `PATH`), direct media/HLS (`.mp4`, `.webm`, `.mov`, `.mkv`, `.m3u8`) URLs, and FFmpeg-generated test streams
-  - **Remote-Stream Mode (`remote-stream`)**: Videos longer than 7 minutes (including 50-hour+ VODs) are probed, scanned, previewed, and clipped directly via HTTP range / remote segments without downloading multi-GB files to disk
+  - **Download 1080p to Folder (Default) & Auto-Prune**: Downloads the video in up to 1080p MP4 into `workspace/sources/<folder>/` (or `CLIPFORGE_SOURCES_DIR`), analyzes & renders locally, and supports an **Auto-Prune Source VOD** toggle in the Ingest view that automatically deletes the source VOD once all queued clips (single or **Queue All Clips** batch) succeed—plus one-click manual pruning in the Render Queue
+  - **Remote-Stream Mode (`remote-stream`)**: Optional toggle for massive VODs (up to 50+ hours) to probe, preview, and clip directly over remote HTTP segments without downloading multi-GB files to disk
 - **Viral Moment Detection**:
   - Streaming O(1)-memory PCM RMS calculation for short videos and stratified multi-window FFmpeg probing + YouTube Most-Replayed heatmap & chapter analysis for multi-hour VODs (returns up to 8 spread-out highlights for ≥1h videos, 4 otherwise)
   - Transcript/SRT hook keyword scoring + multi-provider LLM semantic scoring

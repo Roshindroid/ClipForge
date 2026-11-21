@@ -18,14 +18,18 @@ import {
   Power,
   Download,
   Cookie,
+  FolderOpen,
 } from 'lucide-react';
 import type {
+  AppSettings,
   CreatorWatchItem,
   CustomLLMStatus,
+  IngestStrategy,
   LayoutId,
   LLMRouterState,
   RankingWeights,
   RoutingPriority,
+  StorageStatus,
   SystemCapabilities,
   TrainingDatasetStats,
   VideoProject,
@@ -44,12 +48,17 @@ interface IngestAnalyzeViewProps {
   routerState: LLMRouterState | null;
   customLlm: CustomLLMStatus | null;
   trainingStats: TrainingDatasetStats | null;
+  storageStatus: StorageStatus | null;
+  appSettings: AppSettings;
   onSelectProject: (project: VideoProject) => void;
   onSelectMoment: (moment: ViralMoment) => void;
   onOpenFacecamStudio: (moment: ViralMoment) => void;
   onProjectCreated: (project: VideoProject) => void;
   onProjectUpdated: (project: VideoProject) => void;
   onProjectDeleted: (projectId: string) => void;
+  onCleanupSource: (projectId: string) => Promise<void>;
+  onPruneAllSources: () => Promise<void>;
+  onUpdateAppSettings: (patch: Partial<AppSettings>) => Promise<void>;
   onWeightsUpdated: (weights: RankingWeights) => void;
   onWatchlistUpdated: (items: CreatorWatchItem[]) => void;
   onRouterStateUpdated: (state: LLMRouterState) => void;
@@ -77,12 +86,17 @@ export function IngestAnalyzeView({
   routerState,
   customLlm,
   trainingStats,
+  storageStatus,
+  appSettings,
   onSelectProject,
   onSelectMoment,
   onOpenFacecamStudio,
   onProjectCreated,
   onProjectUpdated,
   onProjectDeleted,
+  onCleanupSource,
+  onPruneAllSources,
+  onUpdateAppSettings,
   onWeightsUpdated,
   onWatchlistUpdated,
   onRouterStateUpdated,
@@ -91,9 +105,13 @@ export function IngestAnalyzeView({
 }: IngestAnalyzeViewProps) {
   const [urlInput, setUrlInput] = useState('');
   const [customTitle, setCustomTitle] = useState('');
+  const [ingestStrategy, setIngestStrategy] = useState<IngestStrategy>('download-1080p');
+  const [downloadFolder, setDownloadFolder] = useState('vods');
   const [transcriptInput, setTranscriptInput] = useState('');
   const [showTranscriptBox, setShowTranscriptBox] = useState(false);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [cleaningId, setCleaningId] = useState<string | null>(null);
+  const [settingsBusy, setSettingsBusy] = useState(false);
   const [ingestProgress, setIngestProgress] = useState(0);
   const [ingestStage, setIngestStage] = useState<string>('');
   const [ingestDetail, setIngestDetail] = useState<string>('');
@@ -147,7 +165,11 @@ export function IngestAnalyzeView({
     setErrorMsg(null);
     setBusyAction('url');
     setIngestProgress(4);
-    setIngestStage('Connecting to stream...');
+    setIngestStage(
+      ingestStrategy === 'download-1080p'
+        ? 'Downloading 1080p video to folder...'
+        : 'Connecting to remote stream...'
+    );
     setIngestDetail('');
 
     try {
@@ -158,6 +180,8 @@ export function IngestAnalyzeView({
           url: urlInput.trim(),
           title: customTitle.trim() || undefined,
           transcriptText: transcriptInput.trim() || undefined,
+          ingestStrategy,
+          downloadFolder: ingestStrategy === 'download-1080p' ? downloadFolder.trim() : undefined,
         }),
       });
       const data = await res.json();
@@ -441,11 +465,32 @@ export function IngestAnalyzeView({
           {/* URL Ingest Form */}
           <form onSubmit={handleUrlIngest} className="lg:col-span-7 flex flex-col justify-between gap-3 bg-[#0E1016] border border-[#232834] rounded-lg p-4">
             <div className="space-y-3">
-              <div className="flex items-center justify-between text-xs text-[#94A3B8]">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[#94A3B8]">
                 <span className="font-medium text-[#CBD5E1]">Stream or Direct Video URL</span>
-                <span>
-                  YouTube · Twitch · Kick · Direct MP4
-                </span>
+                <div className="inline-flex items-center gap-1 p-0.5 bg-[#13161D] border border-[#232834] rounded-md">
+                  <button
+                    type="button"
+                    onClick={() => setIngestStrategy('download-1080p')}
+                    className={`px-2 py-1 text-[11px] font-medium rounded cursor-pointer transition-colors ${
+                      ingestStrategy === 'download-1080p'
+                        ? 'bg-rose-600 text-white'
+                        : 'text-[#94A3B8] hover:text-[#F4F5F7]'
+                    }`}
+                  >
+                    Download 1080p to Folder
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIngestStrategy('remote-stream')}
+                    className={`px-2 py-1 text-[11px] font-medium rounded cursor-pointer transition-colors ${
+                      ingestStrategy === 'remote-stream'
+                        ? 'bg-[#1C212C] text-[#F4F5F7]'
+                        : 'text-[#94A3B8] hover:text-[#F4F5F7]'
+                    }`}
+                  >
+                    Remote Stream (No Download)
+                  </button>
+                </div>
               </div>
               <div className="flex flex-col sm:flex-row gap-2.5">
                 <div className="relative flex-1">
@@ -463,7 +508,13 @@ export function IngestAnalyzeView({
                   disabled={busyAction !== null || !urlInput.trim()}
                   className="px-4 py-2.5 text-xs font-semibold bg-rose-600 hover:bg-rose-500 text-white rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
                 >
-                  {busyAction === 'url' ? 'Downloading & Probing...' : 'Fetch & Analyze'}
+                  {busyAction === 'url'
+                    ? ingestStrategy === 'download-1080p'
+                      ? 'Downloading & Analyzing...'
+                      : 'Probing & Analyzing...'
+                    : ingestStrategy === 'download-1080p'
+                      ? 'Download 1080p & Analyze'
+                      : 'Fetch & Analyze'}
                 </button>
 
                 {busyAction === 'url' && (
@@ -489,8 +540,21 @@ export function IngestAnalyzeView({
                   value={customTitle}
                   onChange={(e) => setCustomTitle(e.target.value)}
                   placeholder="Optional project title override"
-                  className="flex-1 min-w-[200px] px-3 py-1.5 text-xs bg-[#13161D] border border-[#232834] rounded-md text-[#F4F5F7] placeholder:text-[#64748B] outline-none"
+                  className="flex-1 min-w-[180px] px-3 py-1.5 text-xs bg-[#13161D] border border-[#232834] rounded-md text-[#F4F5F7] placeholder:text-[#64748B] outline-none"
                 />
+                {ingestStrategy === 'download-1080p' && (
+                  <div className="flex items-center gap-1.5 bg-[#13161D] border border-[#232834] rounded-md px-2.5 py-1">
+                    <FolderOpen className="w-3.5 h-3.5 text-[#94A3B8] shrink-0" />
+                    <span className="text-[11px] font-mono text-[#64748B]">workspace/sources/</span>
+                    <input
+                      type="text"
+                      value={downloadFolder}
+                      onChange={(e) => setDownloadFolder(e.target.value)}
+                      placeholder="vods"
+                      className="w-24 text-xs font-mono bg-transparent text-[#F4F5F7] placeholder:text-[#64748B] outline-none"
+                    />
+                  </div>
+                )}
                 <button
                   type="button"
                   onClick={() => setShowTranscriptBox((v) => !v)}
@@ -519,9 +583,11 @@ export function IngestAnalyzeView({
             </div>
 
             <p className="text-xs text-[#64748B] mt-1">
-              {capabilities?.ytdlp
-                ? 'Stream extractor ready — long VODs (up to 50+ hours) probe and render directly over remote segments without filling disk.'
-                : 'YouTube, Twitch & Kick links auto-bootstrap yt-dlp on first fetch — long VODs stream on-demand without full multi-GB download.'}
+              {ingestStrategy === 'download-1080p'
+                ? `Downloads 1080p MP4 into workspace/sources/${downloadFolder.trim() || ''} first for fast local analysis & rendering — delete the VOD anytime after generating Shorts.`
+                : capabilities?.ytdlp
+                  ? 'Remote Stream active — long VODs (up to 50+ hours) probe and render remote segments without downloading multi-GB files.'
+                  : 'Remote Stream active — yt-dlp auto-bootstraps on first fetch for remote segment probing.'}
             </p>
           </form>
 
@@ -670,6 +736,50 @@ export function IngestAnalyzeView({
           </div>
         )}
 
+        <div className="mt-4 pt-4 border-t border-[#232834] flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            <HardDrive className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
+            <div>
+              <p className="text-xs font-medium text-[#F4F5F7]">
+                Auto-Prune Source VOD
+              </p>
+              <p className="text-[11px] text-[#94A3B8]">
+                Automatically delete the downloaded VOD file from <span className="font-mono text-[#CBD5E1]">workspace/sources</span> once all queued clips for that project are rendered successfully.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={appSettings.autoPruneSourceVod}
+            disabled={settingsBusy}
+            onClick={async () => {
+              setSettingsBusy(true);
+              try {
+                await onUpdateAppSettings({
+                  autoPruneSourceVod: !appSettings.autoPruneSourceVod,
+                });
+              } finally {
+                setSettingsBusy(false);
+              }
+            }}
+            className={`inline-flex items-center gap-2.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors cursor-pointer disabled:opacity-50 ${
+              appSettings.autoPruneSourceVod
+                ? 'bg-emerald-950/50 border-emerald-600/80 text-emerald-300'
+                : 'bg-[#0E1016] border-[#232834] text-[#94A3B8] hover:text-[#F4F5F7]'
+            }`}
+          >
+            <span
+              className={`w-7 h-4 rounded-full p-0.5 transition-colors flex items-center ${
+                appSettings.autoPruneSourceVod ? 'bg-emerald-500 justify-end' : 'bg-[#2B3242] justify-start'
+              }`}
+            >
+              <span className="w-3 h-3 rounded-full bg-white block" />
+            </span>
+            <span>{appSettings.autoPruneSourceVod ? 'Auto-Prune ON' : 'Auto-Prune OFF'}</span>
+          </button>
+        </div>
+
         {errorMsg && (
           <div className="mt-4 px-4 py-3 text-xs text-rose-200 bg-rose-950/50 border border-rose-800/70 rounded-lg">
             {errorMsg}
@@ -680,14 +790,38 @@ export function IngestAnalyzeView({
       {/* Source Projects Strip */}
       {projects.length > 0 && (
         <section className="space-y-3">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <h3 className="font-display text-sm font-semibold text-[#CBD5E1]">
               Analyzed Source Videos ({projects.length})
             </h3>
+            {storageStatus && storageStatus.totalSourceBytes > 0 && (
+              <div className="flex items-center gap-3 text-xs">
+                <span className="font-mono text-[#94A3B8]">
+                  Downloaded VODs: {formatDiskBytes(storageStatus.totalSourceBytes)}
+                </span>
+                <button
+                  type="button"
+                  disabled={cleaningId !== null}
+                  onClick={async () => {
+                    setCleaningId('all');
+                    try {
+                      await onPruneAllSources();
+                    } finally {
+                      setCleaningId(null);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-[#1C212C] hover:bg-rose-950/60 border border-[#32394A] hover:border-rose-700 rounded-md text-amber-300 cursor-pointer disabled:opacity-50"
+                >
+                  <HardDrive className="w-3.5 h-3.5" />
+                  {cleaningId === 'all' ? 'Deleting VODs...' : 'Delete All Downloaded VODs'}
+                </button>
+              </div>
+            )}
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
             {projects.map((p) => {
               const isSelected = activeProject?.id === p.id;
+              const hasLocalVod = p.sourceMode !== 'remote-stream' && !p.sourceDeleted;
               return (
                 <div
                   key={p.id}
@@ -716,18 +850,47 @@ export function IngestAnalyzeView({
                     <p className="text-xs text-[#94A3B8] font-mono tabular-nums mt-0.5 truncate">
                       {p.sourceType.toUpperCase()} · {formatTime(p.durationSec)} · {p.width}×{p.height} · {p.moments.length} clips
                     </p>
+                    <p className="text-[11px] font-mono text-[#64748B] truncate mt-0.5">
+                      {p.sourceDeleted
+                        ? 'VOD deleted (Shorts preserved)'
+                        : p.sourceMode === 'remote-stream'
+                          ? 'Remote stream'
+                          : `${formatDiskBytes(p.sourceSizeBytes)} · workspace/sources/${p.fileName}`}
+                    </p>
                   </div>
-                  <button
-                    type="button"
-                    aria-label="Delete project"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onProjectDeleted(p.id);
-                    }}
-                    className="p-1.5 text-[#64748B] hover:text-rose-400 rounded-md cursor-pointer"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  <div className="flex flex-col items-end gap-1 shrink-0">
+                    <button
+                      type="button"
+                      aria-label="Delete project"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onProjectDeleted(p.id);
+                      }}
+                      className="p-1.5 text-[#64748B] hover:text-rose-400 rounded-md cursor-pointer"
+                      title="Delete entire project"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                    {hasLocalVod && (
+                      <button
+                        type="button"
+                        disabled={cleaningId !== null}
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          setCleaningId(p.id);
+                          try {
+                            await onCleanupSource(p.id);
+                          } finally {
+                            setCleaningId(null);
+                          }
+                        }}
+                        title="Delete downloaded VOD from folder (keeps Shorts & thumbnails)"
+                        className="px-2 py-0.5 text-[10px] font-mono bg-[#1C212C] hover:bg-rose-950/60 border border-[#32394A] rounded text-amber-300 cursor-pointer"
+                      >
+                        {cleaningId === p.id ? '...' : 'Free VOD'}
+                      </button>
+                    )}
+                  </div>
                 </div>
               );
             })}
@@ -745,27 +908,36 @@ export function IngestAnalyzeView({
                 <h3 className="font-display text-base font-semibold text-[#F4F5F7] truncate">
                   {activeProject.title}
                 </h3>
-                <p className="text-xs text-[#94A3B8] font-mono tabular-nums mt-0.5">
+                <p className="text-xs text-[#94A3B8] font-mono tabular-nums mt-0.5 truncate">
                   {activeProject.width}×{activeProject.height} · {activeProject.fps} fps · Facecam: {activeProject.detectedFacecam.presetLabel}
                   {activeProject.sourceSizeBytes ? ` · ${formatDiskBytes(activeProject.sourceSizeBytes)}` : ''}
                 </p>
+                {activeProject.sourceMode !== 'remote-stream' && !activeProject.sourceDeleted && (
+                  <p className="text-[11px] text-[#64748B] font-mono truncate mt-0.5">
+                    Folder: workspace/sources/{activeProject.fileName}
+                  </p>
+                )}
               </div>
               <div className="flex items-center gap-3 shrink-0">
                 {!activeProject.sourceDeleted && activeProject.sourceMode !== 'remote-stream' && (
                   <button
                     type="button"
+                    disabled={cleaningId !== null}
                     onClick={async () => {
-                      const res = await fetch(`/api/projects/${activeProject.id}/cleanup-source`, {
-                        method: 'POST',
-                      });
-                      const data = await res.json();
-                      if (res.ok && data.project) onProjectUpdated(data.project);
+                      setCleaningId(activeProject.id);
+                      try {
+                        await onCleanupSource(activeProject.id);
+                      } finally {
+                        setCleaningId(null);
+                      }
                     }}
-                    title="Delete large source VOD from disk after rendering Shorts (keeps frames & rendered clips)"
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-md text-[#CBD5E1] cursor-pointer whitespace-nowrap"
+                    title="Delete downloaded source VOD from folder after generating Shorts (keeps thumbnails & rendered clips)"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-[#1C212C] hover:bg-rose-950/60 border border-[#32394A] hover:border-rose-700 rounded-md text-amber-300 cursor-pointer whitespace-nowrap disabled:opacity-50"
                   >
                     <HardDrive className="w-3.5 h-3.5 text-amber-400" />
-                    Prune Source
+                    {cleaningId === activeProject.id
+                      ? 'Deleting VOD...'
+                      : `Delete VOD (${formatDiskBytes(activeProject.sourceSizeBytes)})`}
                   </button>
                 )}
                 {activeProject.sourceMode === 'remote-stream' && (

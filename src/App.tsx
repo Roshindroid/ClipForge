@@ -6,11 +6,13 @@ import {
   Youtube,
 } from 'lucide-react';
 import type {
+  AppSettings,
   CreatorWatchItem,
   CustomLLMStatus,
   LLMRouterState,
   RankingWeights,
   RenderedClip,
+  StorageStatus,
   SystemCapabilities,
   TrainingDatasetStats,
   VideoProject,
@@ -45,7 +47,16 @@ export default function App() {
   const [customLlm, setCustomLlm] = useState<CustomLLMStatus | null>(null);
   const [trainingStats, setTrainingStats] = useState<TrainingDatasetStats | null>(null);
   const [connectedChannel, setConnectedChannel] = useState<YouTubeChannelProfile | null>(null);
+  const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
+  const [appSettings, setAppSettings] = useState<AppSettings>({ autoPruneSourceVod: false });
   const [loadingInitial, setLoadingInitial] = useState(true);
+
+  const refreshStorageStatus = () => {
+    fetch('/api/storage/status')
+      .then((r) => r.json())
+      .then((s) => setStorageStatus(s))
+      .catch(() => {});
+  };
 
   useEffect(() => {
     let mounted = true;
@@ -57,27 +68,43 @@ export default function App() {
       fetch('/api/watchlist').then((r) => r.json()),
       fetch('/api/llm-router').then((r) => r.json()),
       fetch('/api/custom-llm/status').then((r) => r.json()),
+      fetch('/api/storage/status').then((r) => r.json()),
+      fetch('/api/settings').then((r) => r.json()),
     ])
-      .then(([capsRes, projRes, clipsRes, weightsRes, watchRes, routerRes, customRes]) => {
-        if (!mounted) return;
-        setCapabilities(capsRes);
-        const loadedProjects: VideoProject[] = projRes.projects || [];
-        setProjects(loadedProjects);
-        if (loadedProjects.length > 0) {
-          setActiveProject(loadedProjects[0]);
-          setSelectedMoment(loadedProjects[0].moments[0] || null);
+      .then(
+        ([
+          capsRes,
+          projRes,
+          clipsRes,
+          weightsRes,
+          watchRes,
+          routerRes,
+          customRes,
+          storageRes,
+          settingsRes,
+        ]) => {
+          if (!mounted) return;
+          setCapabilities(capsRes);
+          const loadedProjects: VideoProject[] = projRes.projects || [];
+          setProjects(loadedProjects);
+          if (loadedProjects.length > 0) {
+            setActiveProject(loadedProjects[0]);
+            setSelectedMoment(loadedProjects[0].moments[0] || null);
+          }
+          const loadedClips: RenderedClip[] = clipsRes.clips || [];
+          setClips(loadedClips);
+          if (loadedClips.length > 0) {
+            setSelectedClipId(loadedClips[0].id);
+          }
+          setWeights(weightsRes.weights || null);
+          setWatchlist(watchRes.watchlist || []);
+          setRouterState(routerRes || null);
+          setCustomLlm(customRes?.customLlm || null);
+          setTrainingStats(customRes?.trainingStats || null);
+          setStorageStatus(storageRes || null);
+          if (settingsRes?.settings) setAppSettings(settingsRes.settings);
         }
-        const loadedClips: RenderedClip[] = clipsRes.clips || [];
-        setClips(loadedClips);
-        if (loadedClips.length > 0) {
-          setSelectedClipId(loadedClips[0].id);
-        }
-        setWeights(weightsRes.weights || null);
-        setWatchlist(watchRes.watchlist || []);
-        setRouterState(routerRes || null);
-        setCustomLlm(customRes?.customLlm || null);
-        setTrainingStats(customRes?.trainingStats || null);
-      })
+      )
       .finally(() => {
         if (mounted) setLoadingInitial(false);
       });
@@ -91,6 +118,7 @@ export default function App() {
     setProjects((prev) => [project, ...prev]);
     setActiveProject(project);
     setSelectedMoment(project.moments[0] || null);
+    refreshStorageStatus();
   };
 
   const handleProjectUpdated = (updated: VideoProject) => {
@@ -116,13 +144,65 @@ export default function App() {
         setActiveProject(next);
         setSelectedMoment(next?.moments[0] || null);
       }
+      refreshStorageStatus();
     }
   };
 
-  const handleClipRendered = (clip: RenderedClip) => {
+  const handleCleanupProjectSource = async (projectId: string) => {
+    const res = await fetch(`/api/projects/${projectId}/cleanup-source`, { method: 'POST' });
+    const data = await res.json();
+    if (res.ok && data.project) {
+      handleProjectUpdated(data.project);
+      if (data.storage) setStorageStatus(data.storage);
+    }
+  };
+
+  const handlePruneAllSources = async () => {
+    const res = await fetch('/api/storage/prune-sources', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok && Array.isArray(data.projects)) {
+      const updatedList: VideoProject[] = data.projects;
+      setProjects(updatedList);
+      if (activeProject) {
+        const refreshed = updatedList.find((p) => p.id === activeProject.id) || null;
+        setActiveProject(refreshed);
+      }
+      if (data.storage) setStorageStatus(data.storage);
+    }
+  };
+
+  const handleUpdateAppSettings = async (patch: Partial<AppSettings>) => {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    const data = await res.json();
+    if (res.ok && data.settings) {
+      setAppSettings(data.settings);
+    }
+  };
+
+  const handleClipRendered = (clip: RenderedClip, updatedProject?: VideoProject) => {
     setClips((prev) => [clip, ...prev]);
     setSelectedClipId(clip.id);
+    if (updatedProject) {
+      handleProjectUpdated(updatedProject);
+    }
     setActiveTab('queue');
+    refreshStorageStatus();
+  };
+
+  const handleBatchClipsRendered = (newClips: RenderedClip[], updatedProject?: VideoProject) => {
+    if (newClips.length > 0) {
+      setClips((prev) => [...newClips.slice().reverse(), ...prev]);
+      setSelectedClipId(newClips[0].id);
+    }
+    if (updatedProject) {
+      handleProjectUpdated(updatedProject);
+    }
+    setActiveTab('queue');
+    refreshStorageStatus();
   };
 
   const handleClipDeleted = async (clipId: string) => {
@@ -133,6 +213,7 @@ export default function App() {
       if (selectedClipId === clipId) {
         setSelectedClipId(remaining[0]?.id || null);
       }
+      refreshStorageStatus();
     }
   };
 
@@ -310,6 +391,8 @@ export default function App() {
                   routerState={routerState}
                   customLlm={customLlm}
                   trainingStats={trainingStats}
+                  storageStatus={storageStatus}
+                  appSettings={appSettings}
                   onSelectProject={(proj) => {
                     setActiveProject(proj);
                     setSelectedMoment(proj.moments[0] || null);
@@ -322,6 +405,9 @@ export default function App() {
                   onProjectCreated={handleProjectCreated}
                   onProjectUpdated={handleProjectUpdated}
                   onProjectDeleted={handleProjectDeleted}
+                  onCleanupSource={handleCleanupProjectSource}
+                  onPruneAllSources={handlePruneAllSources}
+                  onUpdateAppSettings={handleUpdateAppSettings}
                   onWeightsUpdated={setWeights}
                   onWatchlistUpdated={setWatchlist}
                   onRouterStateUpdated={setRouterState}
@@ -334,16 +420,22 @@ export default function App() {
                 <FacecamLayoutStudio
                   project={activeProject}
                   moment={selectedMoment}
+                  appSettings={appSettings}
                   onSelectMoment={setSelectedMoment}
                   onProjectUpdated={handleProjectUpdated}
                   onClipRendered={handleClipRendered}
+                  onBatchClipsRendered={handleBatchClipsRendered}
                 />
               )}
 
               {activeTab === 'queue' && (
                 <RenderQueueView
                   clips={clips}
+                  projects={projects}
+                  storageStatus={storageStatus}
                   onDeleteClip={handleClipDeleted}
+                  onCleanupSource={handleCleanupProjectSource}
+                  onPruneAllSources={handlePruneAllSources}
                   onPublishClip={(clip) => {
                     setSelectedClipId(clip.id);
                     setActiveTab('youtube');
