@@ -7,7 +7,6 @@ import type {
   FacecamBox,
   HeatmapPoint,
   PlatformType,
-  RankingWeights,
   VideoChapter,
   VideoProject,
   ViralMoment,
@@ -15,18 +14,16 @@ import type {
 import { scoreMomentsWithRouter } from './llmRouter.ts';
 import {
   FRAMES_DIR,
-  SOURCES_DIR,
   ensureWorkspace,
   resolveSafeChildPath,
   resolveSafeSourcePath,
 } from './storage.ts';
-import { computeFinalRankScore } from './weights.ts';
 import type { ResolvedStreamUrls } from './ytdlp.ts';
 
 const execFileAsync = promisify(execFile);
 
 const MAX_ENERGY_SERIES_POINTS = 240;
-const FULL_SCAN_MAX_DURATION_SEC = 1200; // 20 minutes; longer videos (up to 50+ hours) use stratified probing
+const FULL_SCAN_MAX_DURATION_SEC = 1200;
 
 interface ProbeResult {
   durationSec: number;
@@ -81,6 +78,21 @@ export function formatTimecode(sec: number): string {
     return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   }
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+export function computeFinalRankScore(m: {
+  audioSpikeScore: number;
+  transcriptScore: number;
+  llmScore: number;
+  durationSec: number;
+}): number {
+  const durationFit = m.durationSec >= 12 && m.durationSec <= 48 ? 1.0 : 0.72;
+  const raw =
+    m.audioSpikeScore * 0.36 +
+    m.transcriptScore * 0.28 +
+    m.llmScore * 0.26 +
+    durationFit * 0.1;
+  return Math.round(Math.min(0.99, Math.max(0.1, raw)) * 100) / 100;
 }
 
 export async function probeVideo(filePathOrUrl: string): Promise<ProbeResult> {
@@ -162,10 +174,6 @@ export async function extractPreviewFrames(
   return frameUrls;
 }
 
-/**
- * Streams PCM chunks incrementally from FFmpeg without accumulating GBs in RAM,
- * returning per-second RMS dB values.
- */
 async function streamPcmRmsWindow(
   audioInput: string,
   startSec?: number,
@@ -301,7 +309,6 @@ function bucketEnergySeries(
   const result: AudioEnergyPoint[] = [];
   for (let i = 0; i < bucketCount; i++) {
     const b = buckets[i];
-    // Preserve peaks inside each bucket so audio spikes stay clearly visible across 50-hour timelines
     const db = b.count > 0 ? Math.round((b.maxDb * 0.65 + (b.sumDb / b.count) * 0.35) * 10) / 10 : minDb;
     result.push({
       sec: Math.round(i * bucketSpan),
@@ -312,6 +319,130 @@ function bucketEnergySeries(
   return result;
 }
 
+interface ParsedTranscriptCue {
+  startSec: number;
+  endSec: number;
+  text: string;
+}
+
+const VIRAL_HOOK_TERMS = [
+  'no way',
+  'wait',
+  'what',
+  'insane',
+  'clutch',
+  'bro',
+  'watch',
+  'secret',
+  'actually',
+  'crazy',
+  'how',
+  'never',
+  'why',
+  'oh my',
+  'lets go',
+  "let's go",
+  'unbelievable',
+  'glitch',
+  'won',
+  'best',
+];
+
+function parseTranscriptInput(raw?: string, totalDurationSec = 60): ParsedTranscriptCue[] {
+  if (!raw || !raw.trim()) return [];
+  const trimmed = raw.trim();
+
+  const srtBlocks = trimmed.split(/\r?\n\r?\n+/);
+  const cues: ParsedTranscriptCue[] = [];
+  const tsRegex =
+    /(\d{1,2}:)?(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}:)?(\d{2}):(\d{2})[,.](\d{3})/;
+
+  for (const block of srtBlocks) {
+    const lines = block.split(/\r?\n/);
+    const tsLineIdx = lines.findIndex((l) => tsRegex.test(l));
+    if (tsLineIdx >= 0) {
+      const m = lines[tsLineIdx].match(tsRegex);
+      if (m) {
+        const startSec =
+          (m[1] ? parseInt(m[1], 10) * 3600 : 0) +
+          parseInt(m[2], 10) * 60 +
+          parseInt(m[3], 10) +
+          parseInt(m[4], 10) / 1000;
+        const endSec =
+          (m[5] ? parseInt(m[5], 10) * 3600 : 0) +
+          parseInt(m[6], 10) * 60 +
+          parseInt(m[7], 10) +
+          parseInt(m[8], 10) / 1000;
+        const text = lines
+          .slice(tsLineIdx + 1)
+          .join(' ')
+          .replace(/<[^>]+>/g, '')
+          .trim();
+        if (text) cues.push({ startSec, endSec, text });
+      }
+    }
+  }
+
+  if (cues.length > 0) return cues;
+
+  const sentences = trimmed
+    .split(/(?<=[.!?])\s+|\r?\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (sentences.length === 0) return [];
+  const chunkDur = totalDurationSec / sentences.length;
+  return sentences.map((text, idx) => ({
+    startSec: idx * chunkDur,
+    endSec: (idx + 1) * chunkDur,
+    text,
+  }));
+}
+
+function scoreTranscriptWindow(
+  cues: ParsedTranscriptCue[],
+  startSec: number,
+  endSec: number
+): { score: number; snippet: string } {
+  const overlapping = cues.filter((c) => c.endSec >= startSec && c.startSec <= endSec);
+  if (overlapping.length === 0) {
+    return { score: 0.48, snippet: '' };
+  }
+  const combined = overlapping.map((c) => c.text).join(' ').slice(0, 240);
+  const lower = combined.toLowerCase();
+
+  let hits = 0;
+  for (const term of VIRAL_HOOK_TERMS) {
+    if (lower.includes(term)) hits++;
+  }
+  const exclamations = (combined.match(/[!?]/g) || []).length;
+  const wordDensity = Math.min(1, combined.split(/\s+/).length / 28);
+  const score = Math.min(0.98, 0.4 + hits * 0.12 + exclamations * 0.08 + wordDensity * 0.18);
+  return { score: Math.round(score * 100) / 100, snippet: combined };
+}
+
+function findHighHookTranscriptTargets(
+  cues: ParsedTranscriptCue[],
+  durationSec: number
+): Array<{ startSec: number; hintTitle?: string }> {
+  if (cues.length === 0 || durationSec < 60) return [];
+  const windowSize = 32;
+  const step = 20;
+  const scored: Array<{ startSec: number; score: number; snippet: string }> = [];
+
+  for (let t = 0; t < durationSec - 15; t += step) {
+    const res = scoreTranscriptWindow(cues, t, t + windowSize);
+    if (res.snippet && res.score >= 0.62) {
+      scored.push({ startSec: t, score: res.score, snippet: res.snippet });
+    }
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 10).map((s) => ({
+    startSec: s.startSec,
+    hintTitle: s.snippet.slice(0, 90),
+  }));
+}
+
 export async function analyzeAudioEnergy(
   audioInput: string,
   durationSec: number,
@@ -319,6 +450,7 @@ export async function analyzeAudioEnergy(
   options?: {
     heatmap?: HeatmapPoint[];
     chapters?: VideoChapter[];
+    cues?: ParsedTranscriptCue[];
     onProgress?: (pct: number, stage: string, detail?: string) => void;
   }
 ): Promise<{
@@ -337,18 +469,15 @@ export async function analyzeAudioEnergy(
     return { series, windowSpikes: [] };
   }
 
-  // Short/medium local videos (<= 20 min): stream full PCM at 1s resolution in low memory
   if (!isRemoteInput(audioInput) && durationSec <= FULL_SCAN_MAX_DURATION_SEC) {
-    options?.onProgress?.(40, 'Scanning full audio RMS curve...');
+    options?.onProgress?.(40, 'Scanning local audio spikes...');
     const rawPoints = await streamPcmRmsWindow(audioInput, undefined, undefined, 120000);
     const series = bucketEnergySeries(rawPoints, durationSec);
     return { series, windowSpikes: buildSpikesFromDensePoints(rawPoints, durationSec) };
   }
 
-  // Long videos (> 20 min, up to 50+ hours, local or remote stream):
-  // Stratified multi-window FFmpeg probing + YouTube heatmap & chapter guidance
   const probeTargets: Array<{ startSec: number; hintTitle?: string; heatmapBoost?: number }> = [];
-  const numStratified = durationSec >= 36000 ? 44 : 32; // up to 44 stratified windows across 50 hours
+  const numStratified = durationSec >= 36000 ? 44 : 28;
   const probeDurSec = 10;
   const usableSpan = Math.max(1, durationSec - 35);
 
@@ -357,11 +486,8 @@ export async function analyzeAudioEnergy(
     probeTargets.push({ startSec: start });
   }
 
-  // Inject top YouTube Most-Replayed heatmap peaks if present
   if (options?.heatmap && options.heatmap.length > 0) {
-    const topHeat = [...options.heatmap]
-      .sort((a, b) => b.value - a.value)
-      .slice(0, 10);
+    const topHeat = [...options.heatmap].sort((a, b) => b.value - a.value).slice(0, 10);
     for (const h of topHeat) {
       probeTargets.push({
         startSec: Math.max(0, Math.min(usableSpan, Math.floor(h.startSec))),
@@ -370,7 +496,6 @@ export async function analyzeAudioEnergy(
     }
   }
 
-  // Inject chapter openings if chapters exist
   if (options?.chapters && options.chapters.length > 0) {
     const step = Math.max(1, Math.floor(options.chapters.length / 8));
     for (let i = 0; i < options.chapters.length && i < step * 8; i += step) {
@@ -382,7 +507,16 @@ export async function analyzeAudioEnergy(
     }
   }
 
-  // Deduplicate probe positions within 25s of each other
+  if (options?.cues && options.cues.length > 0) {
+    const transcriptTargets = findHighHookTranscriptTargets(options.cues, durationSec);
+    for (const tt of transcriptTargets) {
+      probeTargets.push({
+        startSec: Math.max(0, Math.min(usableSpan, Math.floor(tt.startSec))),
+        hintTitle: tt.hintTitle,
+      });
+    }
+  }
+
   probeTargets.sort((a, b) => a.startSec - b.startSec);
   const dedupedTargets: typeof probeTargets = [];
   for (const t of probeTargets) {
@@ -416,8 +550,8 @@ export async function analyzeAudioEnergy(
       completed++;
       options?.onProgress?.(
         35 + Math.round((completed / dedupedTargets.length) * 40),
-        `Scanning timeline audio (${completed}/${dedupedTargets.length})...`,
-        `Probing ${formatTimecode(target.startSec)} / ${formatTimecode(durationSec)}`
+        `Inspecting remote moments (${completed}/${dedupedTargets.length})...`,
+        `Checking ${formatTimecode(target.startSec)} / ${formatTimecode(durationSec)}`
       );
 
       if (pts.length > 0) {
@@ -442,7 +576,6 @@ export async function analyzeAudioEnergy(
   await Promise.all(Array.from({ length: Math.min(concurrency, dedupedTargets.length) }, worker));
 
   if (sampledRaw.length === 0) {
-    // Graceful fallback if remote audio probing timed out on every window: synthesize timeline from heatmap/evenly spaced checkpoints
     const fallbackTargets = dedupedTargets.slice(0, 8);
     const series: AudioEnergyPoint[] = Array.from({ length: Math.min(60, MAX_ENERGY_SERIES_POINTS) }, (_, i) => ({
       sec: Math.round((durationSec * i) / 60),
@@ -459,7 +592,6 @@ export async function analyzeAudioEnergy(
     return { series, windowSpikes };
   }
 
-  // Build uniform 160-bucket timeline across 0..durationSec for the UI waveform
   const allDbs = sampledRaw.map((p) => p.db);
   const meanDb = allDbs.reduce((a, b) => a + b, 0) / allDbs.length;
   const minDb = arrayMin(allDbs, -48);
@@ -484,7 +616,6 @@ export async function analyzeAudioEnergy(
     buckets[bIdx].count++;
   }
 
-  // Fill unprobed gap buckets smoothly near baseline meanDb
   const series: AudioEnergyPoint[] = buckets.map((b, i) => {
     const db = b.count > 0 ? b.maxDb : Math.round(meanDb * 10) / 10;
     return {
@@ -542,7 +673,6 @@ function buildSpikesFromDensePoints(
   const winLen = Math.max(3, Math.round(targetClipDur));
   const maxStart = Math.max(0, Math.floor(durationSec - winLen));
 
-  // Prefix sums for O(N) sliding window instead of O(N^2)
   const windows: WindowSpikeSample[] = [];
   for (let start = 0; start <= maxStart; start++) {
     const endIdx = Math.min(rawPoints.length - 1, start + winLen);
@@ -571,10 +701,6 @@ function buildSpikesFromDensePoints(
   return windows;
 }
 
-/**
- * Probes corner regions of the 16:9 frame via FFmpeg signalstats to estimate where
- * a persistent streamer facecam box sits (comparing saturation/luma variance across regions).
- */
 export async function detectFacecamCandidates(
   videoInput: string,
   width: number,
@@ -658,115 +784,11 @@ export async function detectFacecamCandidates(
   };
 }
 
-interface ParsedTranscriptCue {
-  startSec: number;
-  endSec: number;
-  text: string;
-}
-
-function parseTranscriptInput(raw?: string, totalDurationSec = 60): ParsedTranscriptCue[] {
-  if (!raw || !raw.trim()) return [];
-  const trimmed = raw.trim();
-
-  const srtBlocks = trimmed.split(/\r?\n\r?\n+/);
-  const cues: ParsedTranscriptCue[] = [];
-  const tsRegex =
-    /(\d{1,2}:)?(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}:)?(\d{2}):(\d{2})[,.](\d{3})/;
-
-  for (const block of srtBlocks) {
-    const lines = block.split(/\r?\n/);
-    const tsLineIdx = lines.findIndex((l) => tsRegex.test(l));
-    if (tsLineIdx >= 0) {
-      const m = lines[tsLineIdx].match(tsRegex);
-      if (m) {
-        const startSec =
-          (m[1] ? parseInt(m[1], 10) * 3600 : 0) +
-          parseInt(m[2], 10) * 60 +
-          parseInt(m[3], 10) +
-          parseInt(m[4], 10) / 1000;
-        const endSec =
-          (m[5] ? parseInt(m[5], 10) * 3600 : 0) +
-          parseInt(m[6], 10) * 60 +
-          parseInt(m[7], 10) +
-          parseInt(m[8], 10) / 1000;
-        const text = lines
-          .slice(tsLineIdx + 1)
-          .join(' ')
-          .replace(/<[^>]+>/g, '')
-          .trim();
-        if (text) cues.push({ startSec, endSec, text });
-      }
-    }
-  }
-
-  if (cues.length > 0) return cues;
-
-  const sentences = trimmed
-    .split(/(?<=[.!?])\s+|\r?\n+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (sentences.length === 0) return [];
-  const chunkDur = totalDurationSec / sentences.length;
-  return sentences.map((text, idx) => ({
-    startSec: idx * chunkDur,
-    endSec: (idx + 1) * chunkDur,
-    text,
-  }));
-}
-
-const VIRAL_HOOK_TERMS = [
-  'no way',
-  'wait',
-  'what',
-  'insane',
-  'clutch',
-  'bro',
-  'watch',
-  'secret',
-  'actually',
-  'crazy',
-  'how',
-  'never',
-  'why',
-  'oh my',
-  'lets go',
-  "let's go",
-  'unbelievable',
-  'glitch',
-  'won',
-  'best',
-];
-
-function scoreTranscriptWindow(
-  cues: ParsedTranscriptCue[],
-  startSec: number,
-  endSec: number
-): {
-  score: number;
-  snippet: string;
-} {
-  const overlapping = cues.filter((c) => c.endSec >= startSec && c.startSec <= endSec);
-  if (overlapping.length === 0) {
-    return { score: 0.48, snippet: '' };
-  }
-  const combined = overlapping.map((c) => c.text).join(' ').slice(0, 220);
-  const lower = combined.toLowerCase();
-
-  let hits = 0;
-  for (const term of VIRAL_HOOK_TERMS) {
-    if (lower.includes(term)) hits++;
-  }
-  const exclamations = (combined.match(/[!?]/g) || []).length;
-  const wordDensity = Math.min(1, combined.split(/\s+/).length / 28);
-  const score = Math.min(0.98, 0.4 + hits * 0.12 + exclamations * 0.08 + wordDensity * 0.18);
-  return { score: Math.round(score * 100) / 100, snippet: combined };
-}
-
 export async function findViralMoments(
   projectTitle: string,
   durationSec: number,
   audioEnergy: AudioEnergyPoint[],
-  weights: RankingWeights,
+  sourceMode: 'segments' | 'local',
   transcriptText?: string,
   precomputedSpikes?: WindowSpikeSample[]
 ): Promise<ViralMoment[]> {
@@ -776,7 +798,6 @@ export async function findViralMoments(
     precomputedSpikes && precomputedSpikes.length > 0 ? [...precomputedSpikes] : [];
 
   if (windows.length === 0) {
-    // Re-score directly from bucketed audioEnergySeries (fast O(M) for reanalyze)
     const winLen =
       durationSec <= 25
         ? Math.max(4, Math.min(7, durationSec * 0.35))
@@ -813,7 +834,6 @@ export async function findViralMoments(
     });
   }
 
-  // Spread highlights across long/50-hour videos: up to 8 moments when >= 1 hour, 4 otherwise
   const maxMoments = durationSec >= 3600 ? 8 : 4;
   const minSeparation =
     durationSec >= 3600
@@ -864,15 +884,15 @@ export async function findViralMoments(
     const tsLabel = formatTimecode(c.startSec);
     const defaultTitles = [
       `Wait for the reaction at ${tsLabel}`,
-      `Unfiltered peak moment (${tsLabel}) — ${cleanProjectTitle}`,
-      `Highest audio surge (${c.peakDb} dB) at ${tsLabel}`,
-      `Clutch sequence at ${tsLabel} — ${cleanProjectTitle}`,
+      `Peak moment (${tsLabel}) — ${cleanProjectTitle}`,
+      `Audio surge (${c.peakDb} dB) at ${tsLabel}`,
+      `Highlight sequence at ${tsLabel} — ${cleanProjectTitle}`,
     ];
     const defaultTaglines = [
-      `Peak energy spike at ${tsLabel} — watch the facecam reaction.`,
-      `The exact second the room lost it in ${cleanProjectTitle}.`,
-      `Zero context needed for this ${Math.round(duration)}s stream highlight.`,
-      `Replay-worthy moment extracted from ${cleanProjectTitle}.`,
+      `Peak energy spike at ${tsLabel} — watch the reaction.`,
+      `The exact moment things escalated in ${cleanProjectTitle}.`,
+      `Zero context needed for this ${Math.round(duration)}s clip.`,
+      `Replay-worthy highlight extracted from ${cleanProjectTitle}.`,
     ];
 
     const title = llmOut?.title || defaultTitles[idx % defaultTitles.length];
@@ -880,21 +900,18 @@ export async function findViralMoments(
     const description =
       llmOut?.description ||
       `${hookTagline}\n\nClipped from "${cleanProjectTitle}" (${formatTimecode(c.startSec)} – ${formatTimecode(c.endSec)}). YouTube auto-captions enabled.`;
-    const hashtags = llmOut?.hashtags || ['#shorts', '#gaming', '#streamclips', '#highlights'];
+    const hashtags = llmOut?.hashtags || ['#shorts', '#streamclips', '#highlights'];
     const reason =
       llmOut?.reason ||
-      `Audio spike ${c.peakDb} dB${c.transcriptSnippet ? ' + hook/chapter match' : ' + local ranking weights'}`;
-    const scoredBy = llmOut?.scoredBy || 'Local Heuristic';
+      `Audio spike ${c.peakDb} dB${c.transcriptSnippet ? ' + transcript/heatmap match' : ''}`;
+    const scoredBy = llmOut?.scoredBy || 'ClipForge Scorer';
 
-    const finalRankScore = computeFinalRankScore(
-      {
-        audioSpikeScore: c.audioSpikeScore,
-        transcriptScore: c.transcriptScore,
-        llmScore,
-        durationSec: duration,
-      },
-      weights
-    );
+    const finalRankScore = computeFinalRankScore({
+      audioSpikeScore: c.audioSpikeScore,
+      transcriptScore: c.transcriptScore,
+      llmScore,
+      durationSec: duration,
+    });
 
     return {
       id: `mom_${crypto.randomBytes(4).toString('hex')}`,
@@ -913,7 +930,9 @@ export async function findViralMoments(
       reason,
       scoredBy,
       transcriptSnippet: c.transcriptSnippet,
-      feedback: null,
+      selected: true,
+      segmentStatus: sourceMode === 'local' ? 'ready' : 'pending',
+      segmentSizeBytes: 0,
     };
   });
 
@@ -921,10 +940,10 @@ export async function findViralMoments(
 }
 
 export async function analyzeVideoProject(params: {
-  fileName: string;
+  fileName?: string;
   title: string;
   sourceType: PlatformType;
-  sourceMode?: 'local' | 'remote-stream';
+  sourceMode: 'segments' | 'local';
   downloadFolder?: string;
   sourceUrl?: string;
   streamUrls?: ResolvedStreamUrls;
@@ -932,23 +951,24 @@ export async function analyzeVideoProject(params: {
   chapters?: VideoChapter[];
   heatmap?: HeatmapPoint[];
   transcriptText?: string;
-  weights: RankingWeights;
+  autoTranscriptFetched?: boolean;
   onProgress?: (pct: number, stage: string, detail?: string) => void;
 }): Promise<VideoProject> {
-  const sourceMode = params.sourceMode || 'local';
   const localPath =
-    sourceMode === 'local' ? resolveSafeSourcePath(params.fileName) : '';
+    params.sourceMode === 'local' && params.fileName
+      ? resolveSafeSourcePath(params.fileName)
+      : '';
   const sourceSizeBytes =
-    sourceMode === 'local' && localPath && fs.existsSync(localPath)
+    params.sourceMode === 'local' && localPath && fs.existsSync(localPath)
       ? fs.statSync(localPath).size
       : 0;
 
   const videoInput =
-    sourceMode === 'remote-stream'
+    params.sourceMode === 'segments'
       ? params.streamUrls?.videoUrl || params.sourceUrl || ''
       : localPath;
   const audioInput =
-    sourceMode === 'remote-stream'
+    params.sourceMode === 'segments'
       ? params.streamUrls?.audioUrl || params.streamUrls?.videoUrl || params.sourceUrl || ''
       : localPath;
 
@@ -956,11 +976,12 @@ export async function analyzeVideoProject(params: {
     throw new Error('Missing video input for analysis.');
   }
 
-  params.onProgress?.(24, 'Probing video stream dimensions...');
+  params.onProgress?.(28, 'Probing video stream dimensions...');
   const probe = params.preProbed || (await probeVideo(videoInput));
   const projectId = `prj_${crypto.randomBytes(5).toString('hex')}`;
+  const cues = parseTranscriptInput(params.transcriptText, probe.durationSec);
 
-  params.onProgress?.(30, 'Extracting keyframes & detecting facecam...');
+  params.onProgress?.(34, 'Extracting keyframes & detecting facecam...');
   const [previewFrames, facecamInfo] = await Promise.all([
     extractPreviewFrames(videoInput, projectId, probe.durationSec),
     detectFacecamCandidates(videoInput, probe.width, probe.height, probe.durationSec),
@@ -969,31 +990,33 @@ export async function analyzeVideoProject(params: {
   const audioAnalysis = await analyzeAudioEnergy(audioInput, probe.durationSec, probe.hasAudio, {
     heatmap: params.heatmap,
     chapters: params.chapters,
+    cues,
     onProgress: params.onProgress,
   });
 
-  params.onProgress?.(82, 'Scoring viral moments with AI router...');
+  params.onProgress?.(85, 'Selecting best viral moments with AI...');
   const moments = await findViralMoments(
     params.title,
     probe.durationSec,
     audioAnalysis.series,
-    params.weights,
+    params.sourceMode,
     params.transcriptText,
     audioAnalysis.windowSpikes
   );
 
-  params.onProgress?.(96, 'Finalizing project workspace...');
+  params.onProgress?.(97, 'Finalizing moment list...');
 
   return {
     id: projectId,
     title: params.title,
     sourceType: params.sourceType,
-    sourceMode,
+    sourceMode: params.sourceMode,
     downloadFolder: params.downloadFolder || undefined,
     sourceUrl: params.sourceUrl,
     fileName: params.fileName,
     sourceSizeBytes,
     sourceDeleted: false,
+    autoTranscriptFetched: params.autoTranscriptFetched,
     durationSec: Math.round(probe.durationSec * 10) / 10,
     width: probe.width,
     height: probe.height,

@@ -2,8 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type {
   AppSettings,
-  CreatorWatchItem,
-  RankingWeights,
   RenderedClip,
   StorageStatus,
   VideoProject,
@@ -17,30 +15,17 @@ export const FRAMES_DIR = path.join(WORKSPACE_ROOT, 'frames');
 export const RENDERS_DIR = process.env.CLIPFORGE_RENDERS_DIR?.trim()
   ? path.resolve(process.env.CLIPFORGE_RENDERS_DIR.trim())
   : path.join(WORKSPACE_ROOT, 'renders');
-export const ASSETS_DIR = path.join(WORKSPACE_ROOT, 'assets');
 
 const PROJECTS_FILE = path.join(WORKSPACE_ROOT, 'projects.json');
 const CLIPS_FILE = path.join(WORKSPACE_ROOT, 'clips.json');
-const WEIGHTS_FILE = path.join(WORKSPACE_ROOT, 'weights.json');
-const WATCHLIST_FILE = path.join(WORKSPACE_ROOT, 'watchlists.json');
 const SETTINGS_FILE = path.join(WORKSPACE_ROOT, 'settings.json');
 
 export const DEFAULT_SETTINGS: AppSettings = {
-  autoPruneSourceVod: false,
-};
-
-export const DEFAULT_WEIGHTS: RankingWeights = {
-  audioSpikeWeight: 0.42,
-  transcriptHookWeight: 0.25,
-  pacingDensityWeight: 0.13,
-  durationSweetSpotWeight: 0.1,
-  llmSemanticWeight: 0.1,
-  updatedAt: new Date().toISOString(),
-  feedbackCount: 0,
+  autoPruneSourceVod: true,
 };
 
 export function ensureWorkspace(): void {
-  for (const dir of [WORKSPACE_ROOT, SOURCES_DIR, FRAMES_DIR, RENDERS_DIR, ASSETS_DIR]) {
+  for (const dir of [WORKSPACE_ROOT, SOURCES_DIR, FRAMES_DIR, RENDERS_DIR]) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
@@ -51,12 +36,6 @@ export function ensureWorkspace(): void {
   if (!fs.existsSync(CLIPS_FILE)) {
     fs.writeFileSync(CLIPS_FILE, '[]', 'utf8');
   }
-  if (!fs.existsSync(WEIGHTS_FILE)) {
-    fs.writeFileSync(WEIGHTS_FILE, JSON.stringify(DEFAULT_WEIGHTS, null, 2), 'utf8');
-  }
-  if (!fs.existsSync(WATCHLIST_FILE)) {
-    fs.writeFileSync(WATCHLIST_FILE, '[]', 'utf8');
-  }
   if (!fs.existsSync(SETTINGS_FILE)) {
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(DEFAULT_SETTINGS, null, 2), 'utf8');
   }
@@ -64,7 +43,7 @@ export function ensureWorkspace(): void {
 
 export function sanitizeFolderName(raw?: string): string {
   if (!raw) return '';
-  const cleaned = raw
+  return raw
     .trim()
     .replace(/\\/g, '/')
     .split('/')
@@ -78,7 +57,6 @@ export function sanitizeFolderName(raw?: string): string {
     .filter((seg) => seg && seg !== '.' && seg !== '..')
     .slice(0, 2)
     .join('/');
-  return cleaned;
 }
 
 export function sanitizeFileSlug(raw: string, maxLen = 48): string {
@@ -90,9 +68,6 @@ export function sanitizeFileSlug(raw: string, maxLen = 48): string {
   return cleaned || 'video';
 }
 
-/**
- * Resolves a filename safely inside a target base directory (blocks path traversal).
- */
 export function resolveSafeChildPath(baseDir: string, unsafeFileName: string): string {
   const cleanName = path.basename(unsafeFileName);
   if (!cleanName || cleanName === '.' || cleanName === '..') {
@@ -106,9 +81,6 @@ export function resolveSafeChildPath(baseDir: string, unsafeFileName: string): s
   return resolvedTarget;
 }
 
-/**
- * Resolves a source relative path (flat file or sanitized subfolder inside SOURCES_DIR).
- */
 export function resolveSafeSourcePath(unsafeRelativePath: string): string {
   const normalized = unsafeRelativePath.replace(/\\/g, '/').replace(/^\/+/, '');
   const parts = normalized.split('/').filter(Boolean);
@@ -138,32 +110,78 @@ function writeJson<T>(filePath: string, data: T): void {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
 }
 
-function syncProjectWithDisk(project: VideoProject): { project: VideoProject; changed: boolean } {
-  if (project.sourceMode === 'remote-stream' || !project.fileName) {
-    return { project, changed: false };
-  }
-  try {
-    const srcPath = resolveSafeSourcePath(project.fileName);
-    const exists = fs.existsSync(srcPath);
-    if (!exists && !project.sourceDeleted) {
-      return {
-        project: { ...project, sourceDeleted: true, sourceSizeBytes: 0 },
-        changed: true,
-      };
-    }
-    if (exists) {
-      const size = fs.statSync(srcPath).size;
-      if (project.sourceDeleted || project.sourceSizeBytes !== size) {
-        return {
-          project: { ...project, sourceDeleted: false, sourceSizeBytes: size },
-          changed: true,
-        };
+function removeEmptySourceSubdir(filePath: string): void {
+  const resolvedBase = path.resolve(SOURCES_DIR);
+  let current = path.dirname(path.resolve(filePath));
+  while (current !== resolvedBase && current.startsWith(resolvedBase + path.sep)) {
+    try {
+      const entries = fs.readdirSync(current);
+      if (entries.length === 0) {
+        fs.rmdirSync(current);
+        current = path.dirname(current);
+      } else {
+        break;
       }
+    } catch {
+      break;
     }
-  } catch {
-    // ignore malformed paths
   }
-  return { project, changed: false };
+}
+
+function syncProjectWithDisk(project: VideoProject): { project: VideoProject; changed: boolean } {
+  let changed = false;
+  let nextProject = project;
+
+  if (project.sourceMode === 'local' && project.fileName) {
+    try {
+      const srcPath = resolveSafeSourcePath(project.fileName);
+      const exists = fs.existsSync(srcPath);
+      if (!exists && !project.sourceDeleted) {
+        nextProject = { ...nextProject, sourceDeleted: true, sourceSizeBytes: 0 };
+        changed = true;
+      } else if (exists) {
+        const size = fs.statSync(srcPath).size;
+        if (nextProject.sourceDeleted || nextProject.sourceSizeBytes !== size) {
+          nextProject = { ...nextProject, sourceDeleted: false, sourceSizeBytes: size };
+          changed = true;
+        }
+      }
+    } catch {
+      // ignore malformed path
+    }
+  }
+
+  let momentsChanged = false;
+  const syncedMoments = nextProject.moments.map((m) => {
+    if (!m.segmentFileName) {
+      return m;
+    }
+    try {
+      const segPath = resolveSafeSourcePath(m.segmentFileName);
+      const exists = fs.existsSync(segPath);
+      if (!exists && m.segmentStatus === 'ready') {
+        momentsChanged = true;
+        return { ...m, segmentStatus: 'pruned' as const, segmentSizeBytes: 0 };
+      }
+      if (exists) {
+        const size = fs.statSync(segPath).size;
+        if (m.segmentStatus !== 'ready' || m.segmentSizeBytes !== size) {
+          momentsChanged = true;
+          return { ...m, segmentStatus: 'ready' as const, segmentSizeBytes: size };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return m;
+  });
+
+  if (momentsChanged) {
+    nextProject = { ...nextProject, moments: syncedMoments };
+    changed = true;
+  }
+
+  return { project: nextProject, changed };
 }
 
 export function listProjects(): VideoProject[] {
@@ -196,24 +214,6 @@ export function saveProject(project: VideoProject): VideoProject {
   return project;
 }
 
-function removeEmptySourceSubdir(filePath: string): void {
-  const resolvedBase = path.resolve(SOURCES_DIR);
-  let current = path.dirname(path.resolve(filePath));
-  while (current !== resolvedBase && current.startsWith(resolvedBase + path.sep)) {
-    try {
-      const entries = fs.readdirSync(current);
-      if (entries.length === 0) {
-        fs.rmdirSync(current);
-        current = path.dirname(current);
-      } else {
-        break;
-      }
-    } catch {
-      break;
-    }
-  }
-}
-
 function cleanupProjectPreviewSlices(projectId: string): number {
   let freed = 0;
   try {
@@ -240,20 +240,47 @@ export function cleanupProjectSource(projectId: string): {
   if (!target) return { project: null, freedBytes: 0 };
 
   let freedBytes = 0;
-  if (target.sourceMode !== 'remote-stream' && target.fileName) {
-    const srcPath = resolveSafeSourcePath(target.fileName);
-    if (fs.existsSync(srcPath)) {
-      freedBytes += fs.statSync(srcPath).size;
-      fs.unlinkSync(srcPath);
-      removeEmptySourceSubdir(srcPath);
+  if (target.sourceMode === 'local' && target.fileName) {
+    try {
+      const srcPath = resolveSafeSourcePath(target.fileName);
+      if (fs.existsSync(srcPath)) {
+        freedBytes += fs.statSync(srcPath).size;
+        fs.unlinkSync(srcPath);
+        removeEmptySourceSubdir(srcPath);
+      }
+    } catch {
+      // ignore
     }
   }
+
+  const nextMoments = target.moments.map((m) => {
+    if (m.segmentFileName) {
+      try {
+        const segPath = resolveSafeSourcePath(m.segmentFileName);
+        if (fs.existsSync(segPath)) {
+          freedBytes += fs.statSync(segPath).size;
+          fs.unlinkSync(segPath);
+          removeEmptySourceSubdir(segPath);
+        }
+      } catch {
+        // ignore
+      }
+      return {
+        ...m,
+        segmentStatus: m.segmentStatus === 'ready' ? ('pruned' as const) : m.segmentStatus,
+        segmentSizeBytes: 0,
+      };
+    }
+    return m;
+  });
+
   freedBytes += cleanupProjectPreviewSlices(projectId);
 
   const updated = saveProject({
     ...target,
-    sourceDeleted: true,
+    sourceDeleted: target.sourceMode === 'local' ? true : target.sourceDeleted,
     sourceSizeBytes: 0,
+    moments: nextMoments,
   });
   return { project: updated, freedBytes };
 }
@@ -265,7 +292,7 @@ export function pruneAllDownloadedSources(): {
   const all = listProjects();
   let freedBytes = 0;
   const updatedProjects = all.map((proj) => {
-    if (proj.sourceMode !== 'remote-stream' && proj.fileName) {
+    if (proj.sourceMode === 'local' && proj.fileName) {
       try {
         const srcPath = resolveSafeSourcePath(proj.fileName);
         if (fs.existsSync(srcPath)) {
@@ -277,11 +304,33 @@ export function pruneAllDownloadedSources(): {
         // ignore
       }
     }
+    const nextMoments = proj.moments.map((m) => {
+      if (m.segmentFileName) {
+        try {
+          const segPath = resolveSafeSourcePath(m.segmentFileName);
+          if (fs.existsSync(segPath)) {
+            freedBytes += fs.statSync(segPath).size;
+            fs.unlinkSync(segPath);
+            removeEmptySourceSubdir(segPath);
+          }
+        } catch {
+          // ignore
+        }
+        return {
+          ...m,
+          segmentStatus: m.segmentStatus === 'ready' ? ('pruned' as const) : m.segmentStatus,
+          segmentSizeBytes: 0,
+        };
+      }
+      return m;
+    });
     freedBytes += cleanupProjectPreviewSlices(proj.id);
-    if (proj.sourceMode !== 'remote-stream' && !proj.sourceDeleted) {
-      return { ...proj, sourceDeleted: true, sourceSizeBytes: 0 };
-    }
-    return proj;
+    return {
+      ...proj,
+      sourceDeleted: proj.sourceMode === 'local' ? true : proj.sourceDeleted,
+      sourceSizeBytes: 0,
+      moments: nextMoments,
+    };
   });
   writeJson(PROJECTS_FILE, updatedProjects);
   return { projects: updatedProjects, freedBytes };
@@ -304,15 +353,23 @@ function walkDirBytes(dir: string): number {
 export function getStorageStatus(): StorageStatus {
   ensureWorkspace();
   const projects = listProjects();
-  const activeVodCount = projects.filter(
-    (p) => p.sourceMode !== 'remote-stream' && !p.sourceDeleted && (p.sourceSizeBytes || 0) > 0
-  ).length;
+  let activeSegmentCount = 0;
+  for (const p of projects) {
+    if (p.sourceMode === 'local' && !p.sourceDeleted && (p.sourceSizeBytes || 0) > 0) {
+      activeSegmentCount++;
+    }
+    for (const m of p.moments) {
+      if (m.segmentStatus === 'ready' && (m.segmentSizeBytes || 0) > 0) {
+        activeSegmentCount++;
+      }
+    }
+  }
   return {
     sourcesDir: SOURCES_DIR,
     rendersDir: RENDERS_DIR,
     totalSourceBytes: walkDirBytes(SOURCES_DIR),
     totalRenderBytes: walkDirBytes(RENDERS_DIR),
-    activeVodCount,
+    activeSegmentCount,
   };
 }
 
@@ -322,7 +379,7 @@ export function deleteProject(projectId: string): boolean {
   if (!target) return false;
   const remaining = all.filter((p) => p.id !== projectId);
   writeJson(PROJECTS_FILE, remaining);
-  if (target.fileName && target.sourceMode !== 'remote-stream') {
+  if (target.fileName && target.sourceMode === 'local') {
     try {
       const srcPath = resolveSafeSourcePath(target.fileName);
       if (fs.existsSync(srcPath)) {
@@ -330,7 +387,20 @@ export function deleteProject(projectId: string): boolean {
         removeEmptySourceSubdir(srcPath);
       }
     } catch {
-      // ignore cleanup errors
+      // ignore
+    }
+  }
+  for (const m of target.moments) {
+    if (m.segmentFileName) {
+      try {
+        const segPath = resolveSafeSourcePath(m.segmentFileName);
+        if (fs.existsSync(segPath)) {
+          fs.unlinkSync(segPath);
+          removeEmptySourceSubdir(segPath);
+        }
+      } catch {
+        // ignore
+      }
     }
   }
   try {
@@ -342,7 +412,7 @@ export function deleteProject(projectId: string): boolean {
       }
     }
   } catch {
-    // ignore cleanup errors
+    // ignore
   }
   return true;
 }
@@ -379,33 +449,18 @@ export function deleteClip(clipId: string): boolean {
     const outPath = resolveSafeChildPath(RENDERS_DIR, target.outputFileName);
     if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
   } catch {
-    // ignore cleanup errors
+    // ignore
   }
   return true;
-}
-
-export function loadWeights(): RankingWeights {
-  return readJson<RankingWeights>(WEIGHTS_FILE, DEFAULT_WEIGHTS);
-}
-
-export function saveWeights(weights: RankingWeights): RankingWeights {
-  writeJson(WEIGHTS_FILE, weights);
-  return weights;
-}
-
-export function listWatchlist(): CreatorWatchItem[] {
-  return readJson<CreatorWatchItem[]>(WATCHLIST_FILE, []);
-}
-
-export function saveWatchlist(items: CreatorWatchItem[]): CreatorWatchItem[] {
-  writeJson(WATCHLIST_FILE, items);
-  return items;
 }
 
 export function loadAppSettings(): AppSettings {
   const raw = readJson<Partial<AppSettings>>(SETTINGS_FILE, DEFAULT_SETTINGS);
   return {
-    autoPruneSourceVod: Boolean(raw.autoPruneSourceVod),
+    autoPruneSourceVod:
+      typeof raw.autoPruneSourceVod === 'boolean'
+        ? raw.autoPruneSourceVod
+        : DEFAULT_SETTINGS.autoPruneSourceVod,
   };
 }
 

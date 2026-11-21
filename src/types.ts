@@ -15,6 +15,8 @@ export type LayoutId =
 
 export type TemplateId = 'none' | 'x-post' | 'tiktok-hook' | 'breaking-news';
 
+export type SegmentDownloadStatus = 'pending' | 'downloading' | 'ready' | 'pruned' | 'error';
+
 export interface FacecamBox {
   /** Normalized 0..1 coordinates relative to source video dimensions */
   x: number;
@@ -35,10 +37,6 @@ export interface BrandingConfig {
   creditText: string;
   backgroundHex: string;
   watermarkText: string;
-  outroEnabled: boolean;
-  outroSeconds: number;
-  musicVolume: number;
-  musicTrackId: string | null;
 }
 
 export interface ViralMoment {
@@ -58,7 +56,11 @@ export interface ViralMoment {
   reason: string;
   scoredBy?: string;
   transcriptSnippet: string;
-  feedback?: 'up' | 'down' | null;
+  selected: boolean;
+  segmentStatus: SegmentDownloadStatus;
+  segmentFileName?: string;
+  segmentSizeBytes?: number;
+  segmentError?: string;
 }
 
 export interface VideoChapter {
@@ -73,18 +75,18 @@ export interface HeatmapPoint {
   value: number;
 }
 
-export type IngestStrategy = 'download-1080p' | 'remote-stream';
-
 export interface VideoProject {
   id: string;
   title: string;
   sourceType: PlatformType;
-  sourceMode?: 'local' | 'remote-stream';
+  /** 'segments' = URL inspected remotely; only selected moments download in 1080p. 'local' = uploaded/sample MP4 */
+  sourceMode: 'segments' | 'local';
   downloadFolder?: string;
   sourceUrl?: string;
-  fileName: string;
+  fileName?: string;
   sourceSizeBytes?: number;
   sourceDeleted?: boolean;
+  autoTranscriptFetched?: boolean;
   durationSec: number;
   width: number;
   height: number;
@@ -106,7 +108,7 @@ export interface StorageStatus {
   rendersDir: string;
   totalSourceBytes: number;
   totalRenderBytes: number;
-  activeVodCount: number;
+  activeSegmentCount: number;
 }
 
 export interface AppSettings {
@@ -139,77 +141,9 @@ export interface RenderedClip {
   youtubeStatus?: 'ready' | 'uploading' | 'published' | 'scheduled';
 }
 
-export interface RankingWeights {
-  audioSpikeWeight: number;
-  transcriptHookWeight: number;
-  pacingDensityWeight: number;
-  durationSweetSpotWeight: number;
-  llmSemanticWeight: number;
-  updatedAt: string;
-  feedbackCount: number;
-}
-
-export interface CreatorWatchItem {
-  id: string;
-  creatorName: string;
-  platform: 'youtube' | 'twitch' | 'kick';
-  channelUrl: string;
-  autoClipEnabled: boolean;
-  defaultLayoutId: LayoutId;
-  minScoreThreshold: number;
-  lastCheckedAt: string;
-}
-
-export type LLMProviderId = 'custom' | 'gemini' | 'groq' | 'openrouter' | 'ollama';
-
-export type RoutingPriority = 'cloud-first' | 'local-first';
-
-export interface LLMProviderStatus {
-  id: LLMProviderId;
-  label: string;
-  configured: boolean;
-  model: string;
-  cooldownUntil: string | null;
-  quotaHits: number;
-  lastError: string | null;
-  lastSuccessAt: string | null;
-}
-
-export interface LLMRouterState {
-  priority: RoutingPriority;
-  providers: LLMProviderStatus[];
-}
-
-export interface CustomLLMStatus {
-  running: boolean;
-  managedByServer: boolean;
-  url: string;
-  backendMode?: string;
-  trainedFeedbackSamples?: number;
-}
-
-export interface TrainingDatasetStats {
-  total: number;
-  positive: number;
-  negative: number;
-}
-
-export interface SystemCapabilities {
-  ffmpeg: boolean;
-  ffprobe: boolean;
-  nvenc: boolean;
-  ytdlp: boolean;
-  ollama: {
-    available: boolean;
-    host: string;
-    models: string[];
-  };
-  workspaceReady: boolean;
-}
-
 export interface JobStatus {
   id: string;
-  type: 'ingest-url' | 'ingest-upload' | 'render';
+  type: 'ingest-url' | 'ingest-upload' | 'download-segments' | 'render';
   status: 'queued' | 'running' | 'completed' | 'failed';
   progress: number;
   stage: string;

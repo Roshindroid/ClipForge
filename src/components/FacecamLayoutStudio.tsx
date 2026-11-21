@@ -65,22 +65,17 @@ export function FacecamLayoutStudio({
     creditText: '@clipforge',
     backgroundHex: '#0B0D11',
     watermarkText: '',
-    outroEnabled: false,
-    outroSeconds: 1.5,
-    musicVolume: 0,
-    musicTrackId: null,
   });
 
   const [clipTitle, setClipTitle] = useState(activeMoment?.title || '');
   const [clipHook, setClipHook] = useState(activeMoment?.hookTagline || '');
   const [isRendering, setIsRendering] = useState(false);
-  const [renderStage, setRenderStage] = useState<string>('');
-  const [renderProgress, setRenderProgress] = useState<number>(0);
+  const [renderStage, setRenderStage] = useState('');
+  const [renderProgress, setRenderProgress] = useState(0);
   const [isSavingCam, setIsSavingCam] = useState(false);
   const [renderError, setRenderError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
 
-  // Sync local state when active project or moment switches
   const prevProjectId = useRef<string | null>(null);
   const prevMomentId = useRef<string | null>(null);
   if (project && prevProjectId.current !== project.id) {
@@ -94,7 +89,6 @@ export function FacecamLayoutStudio({
     setClipHook(activeMoment.hookTagline);
   }
 
-  // Interactive drag on 16:9 source preview
   const containerRef = useRef<HTMLDivElement | null>(null);
   const handleFrameMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -130,10 +124,10 @@ export function FacecamLayoutStudio({
       <div className="bg-[#13161D] border border-[#232834] rounded-xl p-10 text-center space-y-2">
         <Camera className="w-7 h-7 text-[#64748B] mx-auto" />
         <h3 className="font-display text-base font-semibold text-[#F4F5F7]">
-          Analyze a Video First
+          Inspect a Link First
         </h3>
         <p className="text-sm text-[#94A3B8]">
-          Ingest or generate a sample video in Ingest & Analyze to detect the facecam region and choose your 9:16 layout.
+          Start in Discover Moments to inspect a video link, pick your best moments, and configure your 9:16 layout.
         </p>
       </div>
     );
@@ -141,6 +135,9 @@ export function FacecamLayoutStudio({
 
   const activeFrameUrl = project.previewFrames[frameIndex] || project.previewFrames[0] || '';
   const selectedLayoutMeta = LAYOUT_OPTIONS.find((l) => l.id === layoutId) || LAYOUT_OPTIONS[0];
+  const selectedMoments = project.moments.filter((m) => m.selected);
+  const batchTargetMoments = selectedMoments.length > 0 ? selectedMoments : project.moments;
+  const localDeleted = project.sourceMode === 'local' && Boolean(project.sourceDeleted);
 
   const handleSaveFacecam = async () => {
     setIsSavingCam(true);
@@ -154,7 +151,7 @@ export function FacecamLayoutStudio({
       const data = await res.json();
       if (res.ok && data.project) {
         onProjectUpdated(data.project);
-        setSavedNotice('Facecam coordinates saved');
+        setSavedNotice('Saved');
         setTimeout(() => setSavedNotice(null), 2500);
       }
     } finally {
@@ -185,7 +182,7 @@ export function FacecamLayoutStudio({
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'FFmpeg render failed');
+      if (!res.ok) throw new Error(data.error || 'Render failed');
 
       let renderedClip = data.clip;
       let updatedProject = data.project as VideoProject | undefined;
@@ -209,11 +206,11 @@ export function FacecamLayoutStudio({
     }
   };
 
-  const handleRenderAllClips = async () => {
-    if (!project || project.moments.length === 0) return;
+  const handleRenderSelectedBatch = async () => {
+    if (batchTargetMoments.length === 0) return;
     setIsRendering(true);
     setRenderError(null);
-    setRenderStage(`Queueing ${project.moments.length} clips...`);
+    setRenderStage(`Queueing ${batchTargetMoments.length} clip(s)...`);
     setRenderProgress(4);
 
     try {
@@ -222,7 +219,7 @@ export function FacecamLayoutStudio({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           projectId: project.id,
-          momentIds: project.moments.map((m) => m.id),
+          momentIds: batchTargetMoments.map((m) => m.id),
           layoutId,
           templateId,
           facecamBox,
@@ -260,7 +257,6 @@ export function FacecamLayoutStudio({
     }
   };
 
-  // Helper CSS for cropped facecam preview inside 9:16 composite mockup
   const camBgStyle: React.CSSProperties = activeFrameUrl
     ? {
         backgroundImage: `url(${activeFrameUrl})`,
@@ -275,7 +271,6 @@ export function FacecamLayoutStudio({
 
   return (
     <div className="space-y-6">
-      {/* Moment Selector Bar */}
       <div className="bg-[#13161D] border border-[#232834] rounded-xl p-4 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3 min-w-0">
           <span className="text-xs font-medium text-[#94A3B8] shrink-0">Active Moment:</span>
@@ -297,19 +292,18 @@ export function FacecamLayoutStudio({
 
         <div className="flex items-center gap-2 text-xs text-emerald-400 font-medium">
           <ShieldCheck className="w-4 h-4 shrink-0" />
-          <span>No Burned Captions — YouTube Auto-Captions Mode Active</span>
+          <span>Clean Audio · YouTube Auto-Captions Mode</span>
         </div>
       </div>
 
-      {project.sourceDeleted && (
+      {localDeleted && (
         <div className="px-4 py-3 text-xs text-amber-200 bg-amber-950/40 border border-amber-700/60 rounded-xl">
-          This project’s source VOD was deleted from <span className="font-mono">workspace/sources</span> to save disk space. Already-rendered Shorts remain in Render Queue; re-ingest the link if you want to render new clips.
+          This local file was pruned from <span className="font-mono">workspace/sources</span>. Re-upload to render additional clips.
         </div>
       )}
 
-      {/* Main 3-Column Facecam & Layout Studio */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-        {/* Column 1: Source 16:9 Frame + Interactive Facecam Bounding Box */}
+        {/* Column 1: Source Frame + Facecam Drag Box */}
         <section className="xl:col-span-4 bg-[#13161D] border border-[#232834] rounded-xl p-5 space-y-4">
           <div className="flex items-center justify-between gap-2">
             <div>
@@ -317,7 +311,7 @@ export function FacecamLayoutStudio({
                 1. Source Facecam Region
               </h3>
               <p className="text-xs text-[#94A3B8]">
-                Drag box on frame or pick a detected corner candidate.
+                Drag box on frame or pick a detected corner.
               </p>
             </div>
             <button
@@ -326,7 +320,7 @@ export function FacecamLayoutStudio({
               disabled={isSavingCam}
               className="px-2.5 py-1 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-md text-[#F4F5F7] cursor-pointer whitespace-nowrap"
             >
-              {savedNotice ? 'Saved' : isSavingCam ? 'Saving...' : 'Save Box'}
+              {savedNotice || (isSavingCam ? 'Saving...' : 'Save Box')}
             </button>
           </div>
 
@@ -347,7 +341,6 @@ export function FacecamLayoutStudio({
               </div>
             )}
 
-            {/* Draggable Facecam Bounding Box */}
             <div
               onMouseDown={handleFrameMouseDown}
               style={{
@@ -364,7 +357,6 @@ export function FacecamLayoutStudio({
             </div>
           </div>
 
-          {/* Frame Scrubber */}
           {project.previewFrames.length > 1 && (
             <div className="flex items-center gap-2">
               {project.previewFrames.map((url, idx) => (
@@ -382,11 +374,8 @@ export function FacecamLayoutStudio({
             </div>
           )}
 
-          {/* Detected Facecam Corner Candidates */}
           <div className="space-y-2">
-            <span className="text-xs font-medium text-[#CBD5E1]">
-              Detected Facecam Candidates
-            </span>
+            <span className="text-xs font-medium text-[#CBD5E1]">Detected Corners</span>
             <div className="grid grid-cols-2 gap-2">
               {project.facecamCandidates.map((cand) => {
                 const isActive =
@@ -413,7 +402,6 @@ export function FacecamLayoutStudio({
             </div>
           </div>
 
-          {/* Fine Size Sliders */}
           <div className="grid grid-cols-2 gap-3 pt-2 border-t border-[#232834] text-xs">
             <label className="space-y-1">
               <span className="text-[#94A3B8] flex justify-between font-mono tabular-nums">
@@ -452,7 +440,7 @@ export function FacecamLayoutStudio({
           </div>
         </section>
 
-        {/* Column 2: Live 9:16 Vertical Output Composite Preview */}
+        {/* Column 2: Live 9:16 Preview */}
         <section className="xl:col-span-3 bg-[#13161D] border border-[#232834] rounded-xl p-5 flex flex-col items-center space-y-3">
           <div className="w-full flex items-center justify-between">
             <h3 className="font-display text-sm font-semibold text-[#F4F5F7]">
@@ -467,7 +455,6 @@ export function FacecamLayoutStudio({
             style={{ backgroundColor: branding.backgroundHex }}
             className="w-[234px] h-[416px] rounded-xl overflow-hidden border border-[#2E3545] relative shrink-0 select-none"
           >
-            {/* Render live CSS simulation matching each of the 11 FFmpeg layouts */}
             {(layoutId === 'split-top-cam' || layoutId === 'split-50-50') && (
               <div className="w-full h-full flex flex-col">
                 <div
@@ -552,7 +539,6 @@ export function FacecamLayoutStudio({
               <div style={camBgStyle} className="w-full h-full bg-no-repeat" />
             )}
 
-            {/* Template Chrome Overlays (Never Captions) */}
             {templateId === 'x-post' && (
               <div className="absolute top-3 left-3 right-3 z-20 bg-[#0F1117]/95 border border-[#2A303E] rounded-md px-2.5 py-2">
                 <p className="text-[9px] text-[#94A3B8]">{branding.creditText || '@creator'}</p>
@@ -591,14 +577,16 @@ export function FacecamLayoutStudio({
           </p>
         </section>
 
-        {/* Column 3: 11 Facecam Layout Options + Template + Branding + Render */}
+        {/* Column 3: 11 Layouts + Template + Render */}
         <section className="xl:col-span-5 bg-[#13161D] border border-[#232834] rounded-xl p-5 space-y-5">
           <div>
             <h3 className="font-display text-sm font-semibold text-[#F4F5F7]">
-              3. Fix Facecam Placement (11 Layouts)
+              3. Vertical Layout & Render
             </h3>
             <p className="text-xs text-[#94A3B8] mt-0.5">
-              Choose where the detected facecam sits in the rendered 9:16 MP4.
+              {project.sourceMode === 'segments'
+                ? 'Automatically fetches only the needed 1080p segment(s) before rendering 9:16 Shorts.'
+                : 'Renders 720×1280 MP4 directly from your local source file.'}
             </p>
           </div>
 
@@ -628,11 +616,10 @@ export function FacecamLayoutStudio({
             })}
           </div>
 
-          {/* Template & Branding */}
           <div className="pt-4 border-t border-[#232834] space-y-3">
             <div className="flex items-center gap-2 text-xs font-medium text-[#CBD5E1]">
               <Layers className="w-3.5 h-3.5 text-rose-400" />
-              <span>Optional Header Template</span>
+              <span>Optional Header Overlay</span>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
               {TEMPLATES.map((t) => (
@@ -690,7 +677,7 @@ export function FacecamLayoutStudio({
 
             <div className="space-y-2 pt-1">
               <label className="block space-y-1 text-xs">
-                <span className="text-[#94A3B8]">Clip Title & Hook Tagline (for YouTube / Header Template)</span>
+                <span className="text-[#94A3B8]">Clip Title & Hook Tagline</span>
                 <input
                   type="text"
                   value={clipTitle}
@@ -715,41 +702,35 @@ export function FacecamLayoutStudio({
             </div>
           )}
 
-          {project.sourceDeleted && (
-            <div className="px-3 py-2 text-xs text-amber-200 bg-amber-950/40 border border-amber-800/70 rounded-lg">
-              Source video was pruned to free disk space. Re-ingest or select another project to render new clips.
-            </div>
-          )}
-
           <div className="flex flex-col sm:flex-row gap-2.5">
             <button
               type="button"
               onClick={handleRenderClip}
-              disabled={isRendering || Boolean(project.sourceDeleted)}
+              disabled={isRendering || localDeleted}
               className="flex-1 py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white text-sm font-semibold rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
             >
               {isRendering ? (
                 <>
                   <Sparkles className="w-4 h-4 animate-spin" />
-                  {renderStage || 'Rendering 9:16 MP4 via FFmpeg...'} ({renderProgress}%)
+                  {renderStage || 'Rendering...'} ({renderProgress}%)
                 </>
               ) : (
                 <>
                   <Film className="w-4 h-4" />
-                  Render Short ({activeMoment.durationSec}s)
+                  Render This Short ({activeMoment.durationSec}s)
                 </>
               )}
             </button>
 
-            {project.moments.length > 1 && (
+            {batchTargetMoments.length > 1 && (
               <button
                 type="button"
-                onClick={handleRenderAllClips}
-                disabled={isRendering || Boolean(project.sourceDeleted)}
+                onClick={handleRenderSelectedBatch}
+                disabled={isRendering || localDeleted}
                 className="px-4 py-3 bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] text-[#F4F5F7] text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap disabled:opacity-50"
               >
                 <Layers className="w-3.5 h-3.5 text-rose-400" />
-                Queue All {project.moments.length} Clips
+                Render {batchTargetMoments.length} Selected
               </button>
             )}
           </div>
@@ -757,11 +738,11 @@ export function FacecamLayoutStudio({
           <div className="flex flex-wrap items-center justify-center gap-3 text-[11px] text-[#94A3B8]">
             <span className="inline-flex items-center gap-1.5">
               <Check className="w-3.5 h-3.5 text-emerald-400" />
-              Output: 720×1280 H.264 MP4 · Burned Captions: OFF
+              720×1280 H.264 MP4 · Auto-Captions Mode
             </span>
-            {appSettings.autoPruneSourceVod && project.sourceMode !== 'remote-stream' && !project.sourceDeleted && (
+            {appSettings.autoPruneSourceVod && (
               <span className="font-mono text-emerald-400">
-                · Auto-Prune VOD ON
+                · Auto-Prune Segments ON
               </span>
             )}
           </div>

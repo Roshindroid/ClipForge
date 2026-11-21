@@ -1,13 +1,16 @@
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import { Readable } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
-import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { HeatmapPoint, IngestStrategy, PlatformType, VideoChapter } from '../src/types.ts';
+import type {
+  HeatmapPoint,
+  PlatformType,
+  VideoChapter,
+  VideoProject,
+  ViralMoment,
+} from '../src/types.ts';
 import {
   SOURCES_DIR,
   ensureWorkspace,
@@ -17,17 +20,15 @@ import {
   sanitizeFolderName,
 } from './storage.ts';
 import {
-  downloadVideo1080pWithYtDlp,
+  downloadSegmentWithYtDlp,
   ensureYtDlp,
   fetchMetadataWithYtDlp,
+  fetchSubtitlesWithYtDlp,
   resolveStreamUrlsWithYtDlp,
   type ResolvedStreamUrls,
 } from './ytdlp.ts';
 
 const execFileAsync = promisify(execFile);
-
-const LOCAL_DOWNLOAD_MAX_DURATION_SEC = 420;
-const LOCAL_DOWNLOAD_MAX_BYTES = 450 * 1024 * 1024;
 
 const ALLOWED_STREAM_HOSTS = [
   'youtube.com',
@@ -117,19 +118,38 @@ export function detectPlatformFromUrl(rawUrl: string): {
   return { parsedUrl, platform: 'direct', isDirectMediaExt: false };
 }
 
-function runCommand(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+function runCommand(cmd: string, args: string[], timeoutMs = 180000): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { shell: false });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        child.kill('SIGTERM');
+        setTimeout(() => child.kill('SIGKILL'), 2000);
+        reject(new Error(`${cmd} timed out after ${Math.round(timeoutMs / 1000)}s`));
+      }
+    }, timeoutMs);
+
     child.stdout.on('data', (chunk) => {
       stdout += String(chunk);
     });
     child.stderr.on('data', (chunk) => {
       stderr += String(chunk);
     });
-    child.on('error', (err) => reject(err));
+    child.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
     child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
@@ -179,88 +199,12 @@ async function probeRemoteMediaUrl(url: string): Promise<{
   };
 }
 
-async function streamDirectMediaToFile(
-  url: string,
-  targetPath: string,
-  maxBytes?: number,
-  onProgress?: (pct: number, detail: string) => void
-): Promise<void> {
-  const parentDir = path.dirname(targetPath);
-  if (!fs.existsSync(parentDir)) {
-    fs.mkdirSync(parentDir, { recursive: true });
-  }
-
-  const controller = new AbortController();
-  let stallTimer = setTimeout(() => controller.abort(), 60000);
-  const resetStall = () => {
-    clearTimeout(stallTimer);
-    stallTimer = setTimeout(() => controller.abort(), 60000);
-  };
-
-  try {
-    const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
-    if (!res.ok || !res.body) {
-      throw new Error(`Failed to fetch direct media URL (HTTP ${res.status})`);
-    }
-    const contentLength = Number(res.headers.get('content-length') || 0);
-    if (maxBytes && contentLength > maxBytes) {
-      throw new Error('Remote video exceeds eager-download cap.');
-    }
-
-    let downloaded = 0;
-    let lastReportAt = 0;
-    const bodyStream = Readable.fromWeb(res.body as unknown as import('node:stream/web').ReadableStream);
-    bodyStream.on('data', (chunk: Buffer) => {
-      resetStall();
-      downloaded += chunk.length;
-      const now = Date.now();
-      if (onProgress && now - lastReportAt > 500) {
-        lastReportAt = now;
-        const mb = (downloaded / (1024 * 1024)).toFixed(1);
-        if (contentLength > 0) {
-          const pct = Math.min(100, (downloaded / contentLength) * 100);
-          const totalMb = (contentLength / (1024 * 1024)).toFixed(1);
-          onProgress(pct, `${mb} / ${totalMb} MB`);
-        } else {
-          onProgress(35, `${mb} MB downloaded`);
-        }
-      }
-    });
-
-    await pipeline(bodyStream, fs.createWriteStream(targetPath));
-  } finally {
-    clearTimeout(stallTimer);
-  }
-}
-
-function buildSourceFilePath(title: string, id: string, downloadFolder?: string): {
-  fileName: string;
-  targetPath: string;
-  folderLabel: string;
-} {
-  const cleanFolder = sanitizeFolderName(downloadFolder);
-  const slug = sanitizeFileSlug(title, 44);
-  const baseFile = `${slug}_${id}.mp4`;
-  const relativeFileName = cleanFolder ? `${cleanFolder}/${baseFile}` : baseFile;
-  const targetPath = resolveSafeSourcePath(relativeFileName);
-  const parentDir = path.dirname(targetPath);
-  if (!fs.existsSync(parentDir)) {
-    fs.mkdirSync(parentDir, { recursive: true });
-  }
-  return {
-    fileName: relativeFileName,
-    targetPath,
-    folderLabel: cleanFolder || '',
-  };
-}
-
-export interface IngestResult {
-  fileName: string;
+export interface InspectUrlResult {
   title: string;
   platform: PlatformType;
-  sourceMode: 'local' | 'remote-stream';
   downloadFolder?: string;
   streamUrls?: ResolvedStreamUrls;
+  autoTranscriptText?: string;
   preProbed?: {
     durationSec: number;
     width: number;
@@ -272,42 +216,43 @@ export interface IngestResult {
   heatmap?: HeatmapPoint[];
 }
 
-export async function ingestFromUrl(
+/**
+ * Inspects a video/stream link WITHOUT downloading the full video file.
+ * Extracts metadata, heatmaps, chapters, remote stream URLs, and subtitles/auto-captions
+ * so the AI can pinpoint the best moments first before downloading only those parts in 1080p.
+ */
+export async function inspectFromUrl(
   rawUrl: string,
   titleOverride?: string,
   onProgress?: (pct: number, stage: string, detail?: string) => void,
   options?: {
-    ingestStrategy?: IngestStrategy;
     downloadFolder?: string;
+    skipAutoTranscript?: boolean;
   }
-): Promise<IngestResult> {
+): Promise<InspectUrlResult> {
   ensureWorkspace();
   const { parsedUrl, platform, isDirectMediaExt } = detectPlatformFromUrl(rawUrl);
   const id = crypto.randomBytes(4).toString('hex');
-  const strategy: IngestStrategy = options?.ingestStrategy || 'download-1080p';
-  const cleanFolder = sanitizeFolderName(options?.downloadFolder);
+  const cleanFolder = sanitizeFolderName(options?.downloadFolder || 'segments') || 'segments';
 
   if (platform === 'direct') {
-    onProgress?.(6, 'Probing remote video URL...', parsedUrl.hostname);
+    onProgress?.(8, 'Inspecting direct media link...', parsedUrl.hostname);
 
-    let contentLength = 0;
     let contentType = '';
     try {
       const headCtrl = new AbortController();
-      const headTimer = setTimeout(() => headCtrl.abort(), 10000);
+      const headTimer = setTimeout(() => headCtrl.abort(), 8000);
       const headRes = await fetch(parsedUrl.toString(), {
         method: 'HEAD',
         signal: headCtrl.signal,
         redirect: 'follow',
       });
       clearTimeout(headTimer);
-      contentLength = Number(headRes.headers.get('content-length') || 0);
       contentType = (headRes.headers.get('content-type') || '').toLowerCase();
     } catch {
-      // Some CDNs block HEAD requests; fall through to ffprobe
+      // fall through to ffprobe
     }
 
-    const isHlsOrDash = /\.(m3u8|mpd)(\?.*)?$/i.test(parsedUrl.pathname) || contentType.includes('mpegurl');
     if (
       !isDirectMediaExt &&
       contentType &&
@@ -316,46 +261,20 @@ export async function ingestFromUrl(
       !contentType.includes('mpegurl') &&
       !contentType.includes('mp4')
     ) {
-      // Try yt-dlp fallback for generic video page URLs
       try {
-        onProgress?.(10, 'Checking extractor compatibility...', parsedUrl.hostname);
+        onProgress?.(12, 'Fetching remote metadata...', parsedUrl.hostname);
         const meta = await fetchMetadataWithYtDlp(parsedUrl.toString(), 'direct');
         const resolvedTitle = titleOverride?.trim() || meta.title;
-
-        if (strategy === 'download-1080p' && !meta.isLive) {
-          const { fileName, targetPath, folderLabel } = buildSourceFilePath(
-            resolvedTitle,
-            id,
-            cleanFolder
-          );
-          onProgress?.(14, 'Downloading 1080p video to folder...', folderLabel || 'workspace/sources');
-          await downloadVideo1080pWithYtDlp(
-            parsedUrl.toString(),
-            targetPath,
-            'direct',
-            (dlPct, detail) => {
-              const mapped = Math.round(14 + (dlPct / 100) * 36);
-              onProgress?.(mapped, 'Downloading 1080p video to folder...', detail);
-            }
-          );
-          return {
-            fileName,
-            title: resolvedTitle.slice(0, 120),
-            platform: 'direct',
-            sourceMode: 'local',
-            downloadFolder: folderLabel || undefined,
-            chapters: meta.chapters,
-            heatmap: meta.heatmap,
-          };
-        }
-
+        const autoTranscriptText = options?.skipAutoTranscript
+          ? undefined
+          : await fetchSubtitlesWithYtDlp(parsedUrl.toString());
         const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
         return {
-          fileName: `remote_${id}.mp4`,
           title: resolvedTitle.slice(0, 120),
           platform: 'direct',
-          sourceMode: 'remote-stream',
+          downloadFolder: cleanFolder,
           streamUrls,
+          autoTranscriptText,
           preProbed: {
             durationSec: meta.durationSec,
             width: meta.width,
@@ -376,167 +295,175 @@ export async function ingestFromUrl(
       }
     }
 
-    let probed;
-    try {
-      probed = await probeRemoteMediaUrl(parsedUrl.toString());
-    } catch (err) {
+    const probed = await probeRemoteMediaUrl(parsedUrl.toString()).catch((err) => {
       throw new Error(
         err instanceof Error
           ? `Could not read remote media stream: ${err.message}`
           : 'Could not read remote media stream.'
       );
-    }
+    });
 
     const derivedTitle =
       titleOverride?.trim() ||
       path.basename(parsedUrl.pathname, path.extname(parsedUrl.pathname)) ||
       `Direct Stream ${id}`;
 
-    if (
-      strategy === 'remote-stream' &&
-      (isHlsOrDash ||
-        probed.durationSec > LOCAL_DOWNLOAD_MAX_DURATION_SEC ||
-        contentLength > LOCAL_DOWNLOAD_MAX_BYTES)
-    ) {
-      onProgress?.(
-        18,
-        'Remote stream indexed (zero full-VOD download)',
-        `${Math.round(probed.durationSec / 60)} min · ${probed.width}x${probed.height}`
-      );
-      return {
-        fileName: `remote_${id}.mp4`,
-        title: derivedTitle.slice(0, 120),
-        platform: 'direct',
-        sourceMode: 'remote-stream',
-        streamUrls: {
-          videoUrl: parsedUrl.toString(),
-          audioUrl: parsedUrl.toString(),
-          isSeparate: false,
-          resolvedAt: Date.now(),
-        },
-        preProbed: probed,
-      };
-    }
-
-    const { fileName, targetPath, folderLabel } = buildSourceFilePath(
-      derivedTitle,
-      id,
-      cleanFolder
+    onProgress?.(
+      18,
+      'Remote stream indexed (zero full download)',
+      `${Math.round(probed.durationSec / 60)} min · ${probed.width}x${probed.height}`
     );
 
-    if (isHlsOrDash) {
-      onProgress?.(14, 'Downloading 1080p stream to folder...', folderLabel || 'workspace/sources');
-      await downloadVideo1080pWithYtDlp(
-        parsedUrl.toString(),
-        targetPath,
-        'direct',
-        (dlPct, detail) => {
-          const mapped = Math.round(14 + (dlPct / 100) * 36);
-          onProgress?.(mapped, 'Downloading 1080p stream to folder...', detail);
-        }
-      );
-      return {
-        fileName,
-        title: derivedTitle.slice(0, 120),
-        platform,
-        sourceMode: 'local',
-        downloadFolder: folderLabel || undefined,
-      };
-    }
-
-    onProgress?.(14, 'Downloading video file to folder...', folderLabel || 'workspace/sources');
-    await streamDirectMediaToFile(parsedUrl.toString(), targetPath, undefined, (dlPct, detail) => {
-      const mapped = Math.round(14 + (dlPct / 100) * 36);
-      onProgress?.(mapped, 'Downloading video to folder...', detail);
-    });
     return {
-      fileName,
       title: derivedTitle.slice(0, 120),
-      platform,
-      sourceMode: 'local',
-      downloadFolder: folderLabel || undefined,
+      platform: 'direct',
+      downloadFolder: cleanFolder,
+      streamUrls: {
+        videoUrl: parsedUrl.toString(),
+        audioUrl: parsedUrl.toString(),
+        isSeparate: false,
+        resolvedAt: Date.now(),
+      },
       preProbed: probed,
     };
   }
 
-  // Platform link (YouTube / Twitch / Kick): auto-bootstrap yt-dlp if missing
-  onProgress?.(6, 'Preparing stream extractor (yt-dlp)...', platform.toUpperCase());
+  // Platform link (YouTube / Twitch / Kick)
+  onProgress?.(6, 'Preparing link inspector (yt-dlp)...', platform.toUpperCase());
   await ensureYtDlp();
 
-  onProgress?.(10, `Fetching ${platform.toUpperCase()} metadata & heatmaps...`);
+  onProgress?.(12, `Inspecting ${platform.toUpperCase()} metadata, chapters & heatmaps...`);
   const meta = await fetchMetadataWithYtDlp(parsedUrl.toString(), platform);
   const resolvedTitle = titleOverride?.trim() || meta.title;
 
-  if (strategy === 'remote-stream' || meta.isLive) {
-    onProgress?.(
-      20,
-      'Stream indexed for remote scanning',
-      `${(meta.durationSec / 3600).toFixed(1)}h · ${meta.width}x${meta.height}`
-    );
-    const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
-    return {
-      fileName: `remote_${id}.mp4`,
-      title: resolvedTitle.slice(0, 120),
-      platform,
-      sourceMode: 'remote-stream',
-      streamUrls,
-      preProbed: {
-        durationSec: meta.durationSec,
-        width: meta.width,
-        height: meta.height,
-        fps: meta.fps,
-        hasAudio: meta.hasAudio,
-      },
-      chapters: meta.chapters,
-      heatmap: meta.heatmap,
-    };
+  let autoTranscriptText: string | undefined;
+  if (!options?.skipAutoTranscript) {
+    onProgress?.(18, 'Fetching captions & transcript remotely (zero video download)...');
+    autoTranscriptText = await fetchSubtitlesWithYtDlp(parsedUrl.toString()).catch(() => undefined);
   }
 
-  // Default: Download 1080p MP4 directly into workspace/sources (or chosen subfolder) first,
-  // then analyze locally and let the user delete the downloaded VOD after generating Shorts!
-  const { fileName, targetPath, folderLabel } = buildSourceFilePath(
-    resolvedTitle,
-    id,
-    cleanFolder
-  );
+  const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
 
   onProgress?.(
-    14,
-    `Downloading 1080p ${platform.toUpperCase()} VOD to folder...`,
-    folderLabel ? `workspace/sources/${folderLabel}` : 'workspace/sources'
+    24,
+    'Link indexed for AI moment detection',
+    `${(meta.durationSec / 60).toFixed(0)} min · ${meta.width}x${meta.height}`
   );
 
-  try {
-    await downloadVideo1080pWithYtDlp(parsedUrl.toString(), targetPath, platform, (dlPct, detail) => {
-      const mapped = Math.round(14 + (dlPct / 100) * 36);
-      onProgress?.(mapped, 'Downloading 1080p VOD to folder...', detail);
-    });
-  } catch (err) {
-    if (fs.existsSync(targetPath)) {
-      try {
-        fs.unlinkSync(targetPath);
-      } catch {
-        // ignore partial cleanup error
-      }
-    }
-    throw err;
-  }
-
   return {
-    fileName,
     title: resolvedTitle.slice(0, 120),
     platform,
-    sourceMode: 'local',
-    downloadFolder: folderLabel || undefined,
+    downloadFolder: cleanFolder,
+    streamUrls,
+    autoTranscriptText,
+    preProbed: {
+      durationSec: meta.durationSec,
+      width: meta.width,
+      height: meta.height,
+      fps: meta.fps,
+      hasAudio: meta.hasAudio,
+    },
     chapters: meta.chapters,
     heatmap: meta.heatmap,
   };
 }
 
 /**
+ * Downloads ONLY a single AI-selected moment [startSec..endSec] in up to 1080p MP4
+ * into workspace/sources/<folder>/.
+ */
+export async function downloadMomentSegment1080p(params: {
+  project: VideoProject;
+  moment: ViralMoment;
+  onProgress?: (pct: number, detail: string) => void;
+}): Promise<{ segmentFileName: string; segmentSizeBytes: number }> {
+  ensureWorkspace();
+  if (!params.project.sourceUrl) {
+    throw new Error('Project does not have a source URL to download this segment.');
+  }
+
+  const folder = sanitizeFolderName(params.project.downloadFolder || 'segments') || 'segments';
+  const slug = sanitizeFileSlug(params.project.title, 36);
+  const relativeFileName = `${folder}/${slug}_${params.moment.id}.mp4`;
+  const targetPath = resolveSafeSourcePath(relativeFileName);
+
+  const parentDir = path.dirname(targetPath);
+  if (!fs.existsSync(parentDir)) {
+    fs.mkdirSync(parentDir, { recursive: true });
+  }
+
+  // Return existing segment file immediately if already present on disk
+  if (fs.existsSync(targetPath) && fs.statSync(targetPath).size > 4096) {
+    return {
+      segmentFileName: relativeFileName,
+      segmentSizeBytes: fs.statSync(targetPath).size,
+    };
+  }
+
+  const duration = Math.max(2, Math.min(60, params.moment.endSec - params.moment.startSec));
+
+  if (params.project.sourceType === 'direct') {
+    params.onProgress?.(20, 'Extracting 1080p direct slice via FFmpeg...');
+    await runCommand(
+      'ffmpeg',
+      [
+        '-y',
+        '-reconnect',
+        '1',
+        '-reconnect_streamed',
+        '1',
+        '-reconnect_delay_max',
+        '4',
+        '-ss',
+        params.moment.startSec.toFixed(2),
+        '-t',
+        duration.toFixed(2),
+        '-i',
+        params.project.sourceUrl,
+        '-vf',
+        "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-crf',
+        '20',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-movflags',
+        '+faststart',
+        targetPath,
+      ],
+      180000
+    );
+  } else {
+    await downloadSegmentWithYtDlp(
+      params.project.sourceUrl,
+      params.moment.startSec,
+      params.moment.endSec,
+      targetPath,
+      params.project.sourceType,
+      params.onProgress
+    );
+  }
+
+  if (!fs.existsSync(targetPath)) {
+    throw new Error('1080p segment download did not write an MP4 file.');
+  }
+
+  return {
+    segmentFileName: relativeFileName,
+    segmentSizeBytes: fs.statSync(targetPath).size,
+  };
+}
+
+/**
  * Generates a real 18-second 1280x720 MP4 using FFmpeg with animated gameplay motion,
- * a distinct corner facecam overlay box, and multi-peak reaction audio spikes so the
- * full FFmpeg analysis, facecam detection, and 11-layout 9:16 render pipeline can be tested locally.
+ * a distinct corner facecam overlay box, and multi-peak reaction audio spikes for local testing.
  */
 export async function generateSampleStreamVideo(): Promise<{
   fileName: string;
@@ -582,7 +509,7 @@ export async function generateSampleStreamVideo(): Promise<{
 
   return {
     fileName,
-    title: 'Sample Ranked Stream Highlight (16:9 + Bottom-Right Cam)',
+    title: 'Sample Stream Highlight (16:9 + Facecam)',
     platform: 'local',
   };
 }

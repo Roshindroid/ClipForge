@@ -1,21 +1,9 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { SystemCapabilities } from '../src/types.ts';
-import { ensureWorkspace } from './storage.ts';
-import { findExistingYtDlpBinary } from './ytdlp.ts';
 
 const execFileAsync = promisify(execFile);
 
 let cachedNvencSupport: boolean | null = null;
-
-async function checkBinary(cmd: string, args: string[]): Promise<boolean> {
-  try {
-    await execFileAsync(cmd, args, { timeout: 2500 });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Probes whether an actual NVIDIA NVENC hardware encoder works at runtime
@@ -75,24 +63,4 @@ export async function checkOllama(): Promise<{
   } catch {
     return { available: false, host, models: [] };
   }
-}
-
-export async function getSystemCapabilities(): Promise<SystemCapabilities> {
-  ensureWorkspace();
-  const [ffmpeg, ffprobe, nvenc, ytdlpBin, ollama] = await Promise.all([
-    checkBinary('ffmpeg', ['-version']),
-    checkBinary('ffprobe', ['-version']),
-    detectNvencSupport(),
-    findExistingYtDlpBinary(),
-    checkOllama(),
-  ]);
-
-  return {
-    ffmpeg,
-    ffprobe,
-    nvenc,
-    ytdlp: Boolean(ytdlpBin),
-    ollama,
-    workspaceReady: true,
-  };
 }

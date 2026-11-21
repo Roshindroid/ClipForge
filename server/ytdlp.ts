@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -37,7 +38,7 @@ export interface YtDlpMetadata {
 }
 
 const streamUrlCache = new Map<string, ResolvedStreamUrls>();
-const STREAM_CACHE_TTL_MS = 3 * 60 * 60 * 1000; // 3 hours
+const STREAM_CACHE_TTL_MS = 3 * 60 * 60 * 1000;
 
 export async function findExistingYtDlpBinary(): Promise<string | null> {
   try {
@@ -60,7 +61,6 @@ export async function findExistingYtDlpBinary(): Promise<string | null> {
 export async function ensureYtDlp(): Promise<string> {
   const existing = await findExistingYtDlpBinary();
   if (existing) return existing;
-
   if (installPromise) return installPromise;
 
   installPromise = (async () => {
@@ -120,11 +120,7 @@ export function getCookiesStatus(): {
       .readFileSync(envFile, 'utf8')
       .split(/\r?\n/)
       .filter((l) => l.trim() && !l.startsWith('#'));
-    return {
-      configured: lines.length > 0,
-      source: 'env',
-      cookieCount: lines.length,
-    };
+    return { configured: lines.length > 0, source: 'env', cookieCount: lines.length };
   }
 
   if (fs.existsSync(WORKSPACE_COOKIES_PATH)) {
@@ -145,11 +141,7 @@ export function getCookiesStatus(): {
 
   const browserSpec = process.env.YTDLP_COOKIES_FROM_BROWSER?.trim();
   if (browserSpec && hasLocalBrowserProfile(browserSpec)) {
-    return {
-      configured: true,
-      source: 'browser',
-      cookieCount: 1,
-    };
+    return { configured: true, source: 'browser', cookieCount: 1 };
   }
 
   return { configured: false, source: 'none', cookieCount: 0 };
@@ -163,9 +155,7 @@ export function saveCookiesContent(rawInput: string): {
 } {
   ensureWorkspace();
   const trimmed = rawInput.trim();
-  if (!trimmed) {
-    throw new Error('Cookie content cannot be empty.');
-  }
+  if (!trimmed) throw new Error('Cookie content cannot be empty.');
 
   const lines = trimmed.split(/\r?\n/);
   const netscapeLines = lines.filter((l) => {
@@ -180,7 +170,6 @@ export function saveCookiesContent(rawInput: string): {
     finalContent = '# Netscape HTTP Cookie File\n' + netscapeLines.join('\n') + '\n';
     count = netscapeLines.length;
   } else {
-    // Support raw HTTP "Cookie:" header string (key=val; key2=val2)
     const cleaned = trimmed.replace(/^cookie:\s*/i, '');
     const pairs = cleaned
       .split(';')
@@ -257,14 +246,10 @@ export function runProcessWithTimeout(
     }, timeoutMs);
 
     child.stdout.on('data', (chunk) => {
-      if (stdout.length < 4 * 1024 * 1024) {
-        stdout += String(chunk);
-      }
+      if (stdout.length < 4 * 1024 * 1024) stdout += String(chunk);
     });
     child.stderr.on('data', (chunk) => {
-      if (stderr.length < 512 * 1024) {
-        stderr += String(chunk);
-      }
+      if (stderr.length < 512 * 1024) stderr += String(chunk);
     });
     child.on('error', (err) => {
       if (!settled) {
@@ -290,7 +275,7 @@ function formatYtDlpError(rawErr: string, platform: string): Error {
   const lower = rawErr.toLowerCase();
   if (lower.includes('sign in to confirm') || lower.includes('cookies')) {
     return new Error(
-      `${platform.toUpperCase()} requested bot verification from this server IP. Upload or paste your YouTube cookies.txt below (via "YouTube Cookies") and click Fetch & Analyze again.`
+      `${platform.toUpperCase()} requested bot verification from this server IP. Upload or paste your YouTube cookies.txt below (via "YouTube Cookies") and try again.`
     );
   }
   if (lower.includes('private video') || lower.includes('unavailable')) {
@@ -322,7 +307,6 @@ export async function fetchMetadataWithYtDlp(
     );
     stdout = res.stdout;
   } catch (err) {
-    // Fallback without strict format filter in case the site only exposes non-mp4/HLS formats
     try {
       const res = await runProcessWithTimeout(
         bin,
@@ -418,6 +402,51 @@ export async function fetchMetadataWithYtDlp(
   };
 }
 
+/**
+ * Fetches subtitles / auto-captions remotely via yt-dlp (--skip-download) so the AI
+ * can read dialogue across long streams without downloading any video bytes.
+ */
+export async function fetchSubtitlesWithYtDlp(url: string): Promise<string | undefined> {
+  const bin = await ensureYtDlp();
+  const baseArgs = getYtDlpBaseArgs();
+  const tmpDir = path.join(WORKSPACE_ROOT, `subs_${crypto.randomBytes(4).toString('hex')}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  try {
+    await runProcessWithTimeout(
+      bin,
+      [
+        ...baseArgs,
+        '--skip-download',
+        '--write-subs',
+        '--write-auto-subs',
+        '--sub-langs',
+        'en.*,en',
+        '--convert-subs',
+        'srt',
+        '-o',
+        path.join(tmpDir, 'caption.%(ext)s'),
+        url,
+      ],
+      35000
+    ).catch(() => {});
+
+    const files = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.srt') || f.endsWith('.vtt'));
+    if (files.length === 0) return undefined;
+
+    // Prefer manual subs over auto-generated if multiple exist
+    files.sort((a, b) => a.length - b.length);
+    const content = fs.readFileSync(path.join(tmpDir, files[0]), 'utf8').trim();
+    return content.length > 0 ? content : undefined;
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignore temp cleanup errors
+    }
+  }
+}
+
 export async function resolveStreamUrlsWithYtDlp(
   url: string,
   forceRefresh = false
@@ -478,44 +507,16 @@ export async function resolveStreamUrlsWithYtDlp(
   return resolved;
 }
 
+/**
+ * Downloads ONLY the selected time slice [startSec..endSec] in up to 1080p MP4 using yt-dlp
+ * (--download-sections) with live progress and a stall-only timeout.
+ */
 export async function downloadSegmentWithYtDlp(
   url: string,
   startSec: number,
   endSec: number,
-  targetPath: string
-): Promise<void> {
-  const bin = await ensureYtDlp();
-  const baseArgs = getYtDlpBaseArgs();
-  const s = Math.max(0, Math.floor(startSec));
-  const e = Math.max(s + 2, Math.ceil(endSec));
-
-  await runProcessWithTimeout(
-    bin,
-    [
-      ...baseArgs,
-      '--download-sections',
-      `*${s}-${e}`,
-      '--force-keyframes-at-cuts',
-      '-f',
-      'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b',
-      '--merge-output-format',
-      'mp4',
-      '-o',
-      targetPath,
-      url,
-    ],
-    120000
-  );
-}
-
-/**
- * Downloads the full video in up to 1080p MP4 to targetPath using yt-dlp with
- * live progress parsing and a stall-only timeout (so long/multi-GB VODs never abort prematurely).
- */
-export async function downloadVideo1080pWithYtDlp(
-  url: string,
   targetPath: string,
-  platform: string,
+  platform = 'video',
   onProgress?: (pct: number, detail: string) => void
 ): Promise<void> {
   const bin = await ensureYtDlp();
@@ -525,10 +526,16 @@ export async function downloadVideo1080pWithYtDlp(
     fs.mkdirSync(parentDir, { recursive: true });
   }
 
+  const s = Math.max(0, Math.floor(startSec));
+  const e = Math.max(s + 2, Math.ceil(endSec));
+
   const args = [
     ...baseArgs,
     '--newline',
     '--progress',
+    '--download-sections',
+    `*${s}-${e}`,
+    '--force-keyframes-at-cuts',
     '-S',
     'res:1080,ext:mp4:m4a',
     '-f',
@@ -545,14 +552,14 @@ export async function downloadVideo1080pWithYtDlp(
     let stderr = '';
     let lineBuf = '';
     let settled = false;
-    const STALL_TIMEOUT_MS = 180_000;
+    const STALL_TIMEOUT_MS = 120_000;
 
     let stallTimer = setTimeout(() => {
       if (!settled) {
         settled = true;
         child.kill('SIGTERM');
         setTimeout(() => child.kill('SIGKILL'), 2000);
-        reject(new Error('1080p download stalled with no progress for 180s.'));
+        reject(new Error('1080p segment download stalled for 120s.'));
       }
     }, STALL_TIMEOUT_MS);
 
@@ -563,7 +570,7 @@ export async function downloadVideo1080pWithYtDlp(
           settled = true;
           child.kill('SIGTERM');
           setTimeout(() => child.kill('SIGKILL'), 2000);
-          reject(new Error('1080p download stalled with no progress for 180s.'));
+          reject(new Error('1080p segment download stalled for 120s.'));
         }
       }, STALL_TIMEOUT_MS);
     };
@@ -577,20 +584,16 @@ export async function downloadVideo1080pWithYtDlp(
         const m = line.match(/\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+([^\s]+)(?:\s+at\s+([^\s]+))?/i);
         if (m && onProgress) {
           const pct = Math.min(100, Math.max(0, Number(m[1])));
-          const sizeStr = m[2] || '';
-          const speedStr = m[3] ? ` · ${m[3]}` : '';
-          onProgress(pct, `${pct.toFixed(1)}% of ${sizeStr}${speedStr}`);
-        } else if (/\[Merger\]|Merging formats/i.test(line) && onProgress) {
-          onProgress(98, 'Muxing 1080p video + audio into MP4...');
+          onProgress(pct, `${pct.toFixed(0)}% of ${m[2]}`);
         }
       }
     };
 
     child.stdout.on('data', (chunk) => handleChunk(String(chunk)));
     child.stderr.on('data', (chunk) => {
-      const s = String(chunk);
-      if (stderr.length < 512 * 1024) stderr += s;
-      handleChunk(s);
+      const sChunk = String(chunk);
+      if (stderr.length < 512 * 1024) stderr += sChunk;
+      handleChunk(sChunk);
     });
 
     child.on('error', (err) => {
@@ -608,6 +611,13 @@ export async function downloadVideo1080pWithYtDlp(
       if (code === 0 && fs.existsSync(targetPath)) {
         resolve();
       } else {
+        if (fs.existsSync(targetPath)) {
+          try {
+            fs.unlinkSync(targetPath);
+          } catch {
+            // ignore
+          }
+        }
         reject(
           formatYtDlpError(
             stderr.trim() || `${path.basename(bin)} exited with code ${code}`,

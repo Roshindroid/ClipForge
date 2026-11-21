@@ -1,85 +1,54 @@
-# ClipForge — Local Open-Source Stream & Video Clip Engine
+# ClipForge — Smart 1080p Stream & Video Clip Engine
 
-ClipForge extracts viral moments from short clips or 50-hour+ streams/VODs via audio spike analysis, YouTube heatmaps, and multi-provider LLM scoring, detects facecam regions, renders captionless 9:16 YouTube Shorts across 11 layouts, and uploads directly to YouTube.
+ClipForge finds viral moments from short clips or 50-hour+ streams **before downloading full VODs**, lets you verify and select only the moments you want, downloads **only those selected segments in 1080p MP4**, renders clean 9:16 vertical YouTube Shorts across 11 layouts, and publishes directly to YouTube.
 
-## Features
+## How the Smart 1080p Segments Workflow Works
 
-- **Ingest (1080p Folder-First Download & 50-Hour+ Remote Streams)**:
-  - Local MP4/MOV/MKV/WebM uploads (up to 100 GB via disk streaming)
-  - YouTube, Twitch, Kick URLs (auto-bootstraps standalone `yt-dlp` into `workspace/bin/yt-dlp` if not on `PATH`), direct media/HLS (`.mp4`, `.webm`, `.mov`, `.mkv`, `.m3u8`) URLs, and FFmpeg-generated test streams
-  - **Download 1080p to Folder (Default) & Auto-Prune**: Downloads the video in up to 1080p MP4 into `workspace/sources/<folder>/` (or `CLIPFORGE_SOURCES_DIR`), analyzes & renders locally, and supports an **Auto-Prune Source VOD** toggle in the Ingest view that automatically deletes the source VOD once all queued clips (single or **Queue All Clips** batch) succeed—plus one-click manual pruning in the Render Queue
-  - **Remote-Stream Mode (`remote-stream`)**: Optional toggle for massive VODs (up to 50+ hours) to probe, preview, and clip directly over remote HTTP segments without downloading multi-GB files to disk
-- **Viral Moment Detection**:
-  - Streaming O(1)-memory PCM RMS calculation for short videos and stratified multi-window FFmpeg probing + YouTube Most-Replayed heatmap & chapter analysis for multi-hour VODs (returns up to 8 spread-out highlights for ≥1h videos, 4 otherwise)
-  - Transcript/SRT hook keyword scoring + multi-provider LLM semantic scoring
-- **On-Demand 50-Hour Preview & Live Clipping**:
-  - Serves cached 45-second preview slices (`/api/projects/:id/moments/:momentId/preview` and `/api/projects/:id/preview-window`) with a `HH:MM:SS` timestamp jump bar and global-timecode Mark In / Mark Out controls
-- **Facecam Detection & 11 Vertical Layouts**:
-  - FFmpeg `signalstats` probing of 5 corner regions plus interactive drag-and-resize facecam box
-  - 11 layout presets (splits, picture-in-picture, blurred-bg, center-crop, facecam-zoom) rendered at 720×1280 H.264 MP4 (`h264_nvenc` GPU when available, `libx264` CPU fallback)
-- **Templates & Clean Subtitles**:
-  - Optional X Post, TikTok Hook, and Breaking News header overlays — intentionally no burned captions (relies on YouTube auto-captions)
-- **Async Background Jobs**:
-  - Non-blocking `/api/jobs/:id` polling for URL ingest, file uploads, and 9:16 renders with real stage and percentage progress
-- **YouTube Bot-Verification Cookies**:
-  - Supports in-app Netscape `cookies.txt` upload/paste (saved server-side to `workspace/ytdlp_cookies.txt`), `YTDLP_COOKIES_FILE`, or desktop `YTDLP_COOKIES_FROM_BROWSER`
-- **YouTube Publishing**:
-  - Firebase Google sign-in + YouTube Data API v3 resumable upload with scheduling, privacy control, and hashtags
-- **Multi-Provider LLM Router & Custom LLM**:
-  - Quota-aware rotation across Custom LLM, Gemini, Groq, OpenRouter, and local Ollama with 60-minute cooldowns on `429` limits
-  - Python OpenAI-compatible server (`custom_llm/server.py`) with trainable Naive Bayes viral classifier fed by Thumbs Up / Down feedback, plus optional `llama.cpp` GGUF or Ollama backend
-- **Creator Watchlist**:
-  - Save Twitch/Kick/YouTube channels with preferred facecam layout for one-click loading
+1. **Inspect Link (Zero Full-VOD Download)**: Paste a YouTube, Twitch, Kick, or direct `.mp4`/`.m3u8` URL. ClipForge fetches metadata, remote subtitles/auto-captions, YouTube heatmaps/chapters, and stratified remote audio spikes to rank viral moments—without downloading multi-gigabyte VODs.
+2. **Verify & Select Moments**: Check or uncheck detected moments, preview audio/video slices, or click **Verify in Tab** to jump directly to that exact timestamp on the original video in a new browser tab.
+3. **Download Only Selected Segments in 1080p**: Download selected timestamps (`[startSec..endSec]`) into `workspace/sources/<folder>/` at up to 1080p MP4 (`yt-dlp --download-sections` or FFmpeg slice), or jump straight to render and ClipForge fetches missing segments on demand.
+4. **Layout, Render & Auto-Prune**: Frame your facecam across 11 vertical layouts, optionally add a clean header template (X Post, TikTok Hook, Breaking News—no burned captions), batch render 720×1280 H.264 Shorts, and optionally enable **Auto-Prune Segments After Render** to remove temporary 1080p source segments once all queued renders succeed.
+5. **Publish to YouTube**: Sign in with Google OAuth (tokens kept in browser memory only) and upload or schedule Shorts directly via YouTube Data API v3.
 
 ## Tech Stack
 
 - **Frontend**: React 19, TypeScript, Tailwind CSS 4, Vite 8, Motion, Lucide React
 - **Backend**: Express.js + TypeScript (`tsx`)
 - **Video & Stream Extraction**: FFmpeg / ffprobe + `yt-dlp` (system binary or auto-bootstrapped standalone zipapp)
-- **Storage**: Local JSON files & media workspace under `workspace/` (projects, clips, weights, watchlist, training data)
+- **Storage**: Local JSON files & media workspace under `workspace/` (projects, clips, settings, sources, frames, renders)
 - **Auth**: Firebase + YouTube Data API v3
 
 ## Project Structure
 
-```
+```text
 ClipForge/
 ├── server.ts                    # Express server — API routes, job polling, segment previews
 ├── vite.config.ts               # Vite + Tailwind + React plugin
 ├── package.json                 # Node dependencies & scripts
-├── requirements.txt             # Optional Python ML / yt-dlp dependencies
 ├── .env.example                 # Environment variable template
 ├── firebase-applet-config.json  # Firebase config (Google OAuth for YouTube)
 ├── server/                      # Backend modules
-│   ├── analyzer.ts              # Streaming RMS, stratified 50h probing, facecam & viral scoring
-│   ├── capabilities.ts          # ffmpeg/ffprobe/nvenc/yt-dlp/ollama availability checks
-│   ├── customLlmManager.ts      # Spawns/stops Python custom LLM server (:8000)
-│   ├── ingest.ts                # URL ingest (remote-stream & local), direct streaming, sample VOD
+│   ├── analyzer.ts              # Remote probing, transcript hooks, facecam & viral scoring
+│   ├── capabilities.ts          # NVENC hardware encoder & Ollama availability checks
+│   ├── ingest.ts                # Zero-VOD URL inspection, 1080p segment downloader, uploads
 │   ├── jobs.ts                  # In-memory background job queue & progress tracker
-│   ├── llmRouter.ts             # Multi-provider LLM router with quota cooldowns
-│   ├── renderer.ts              # FFmpeg filter graphs for 11 layouts + remote segment rendering
-│   ├── storage.ts               # JSON file CRUD, workspace cleanup & path traversal protection
-│   ├── training.ts              # NDJSON training dataset + stats
-│   ├── weights.ts               # Feedback-driven ranking weight adjustment
-│   └── ytdlp.ts                 # Auto-bootstrapped yt-dlp, cookie store & stream URL resolver
+│   ├── llmRouter.ts             # Optional Gemini / Groq / OpenRouter / Ollama viral scorer
+│   ├── renderer.ts              # FFmpeg filter graphs for 11 vertical 9:16 layouts
+│   ├── storage.ts               # JSON CRUD, workspace cleanup & path traversal guards
+│   └── ytdlp.ts                 # Auto-bootstrapped yt-dlp, cookies, subtitles & section cuts
 ├── src/                         # React frontend
-│   ├── main.tsx, App.tsx        # App shell with 4 tabs: ingest, facecam, queue, youtube
+│   ├── main.tsx, App.tsx        # App shell with 4 steps: Discover, Layout & Render, Shorts, Publish
 │   ├── types.ts                 # Shared TS types, JobStatus & 11 LAYOUT_OPTIONS metadata
 │   ├── index.css                # Tailwind + theme
 │   ├── lib/
 │   │   ├── jobs.ts              # Async job poller & HH:MM:SS timecode helpers
 │   │   └── youtubeAuth.ts       # Firebase Google sign-in + YouTube resumable upload
 │   └── components/
-│       ├── IngestAnalyzeView.tsx     # Upload/URL/cookies/sample ingest, waveform, moments, weights
+│       ├── IngestAnalyzeView.tsx     # Link inspection, moment checklist, 1080p segment downloads
 │       ├── FacecamLayoutStudio.tsx   # Interactive facecam box, 11 layouts, templates, render
-│       ├── RenderQueueView.tsx       # Clip gallery, download, publish to YouTube
+│       ├── RenderQueueView.tsx       # Rendered Shorts gallery, storage cleanup, publish handoff
 │       ├── YouTubePublishView.tsx    # Metadata composer, Google sign-in, resumable upload
 │       └── LayoutThumbnail.tsx       # SVG wireframe previews per layout
-├── custom_llm/                  # Python OpenAI-compatible inference server (:8000)
-│   ├── server.py                # Trainable Naive Bayes viral classifier + llama.cpp/Ollama fallback
-│   ├── finetune_lora.py         # 4-bit QLoRA fine-tuning for GTX 1650 (4 GB VRAM)
-│   ├── Modelfile                # Ollama Modelfile for clipforge-viral:3b
-│   ├── requirements.txt         # Optional fine-tuning dependencies
-│   └── README.md                # Custom LLM documentation
 └── workspace/                   # Runtime data (gitignored: sources, frames, renders, cookies, JSON)
 ```
 
@@ -87,13 +56,13 @@ ClipForge/
 
 ### 1. Install system dependencies
 
-ClipForge requires **FFmpeg** and **ffprobe** on `PATH` (plus **Python 3** if running `custom_llm/server.py` or the standalone `yt-dlp` zipapp).
+ClipForge requires **FFmpeg** and **ffprobe** on `PATH`.
 
 - **Windows**: `winget install ffmpeg`
 - **macOS**: `brew install ffmpeg yt-dlp`
 - **Linux**: `sudo apt install ffmpeg python3`
 
-`yt-dlp` is optional to install globally — if missing from `PATH`, ClipForge automatically downloads the official standalone `yt-dlp` zipapp to `workspace/bin/yt-dlp` on startup/first URL ingest (or install manually via `pip install yt-dlp`).
+`yt-dlp` is optional to install globally — if missing from `PATH`, ClipForge automatically downloads the official standalone `yt-dlp` zipapp to `workspace/bin/yt-dlp` on first URL inspection.
 
 ### 2. Install Node dependencies
 
@@ -103,30 +72,31 @@ npm install
 
 ### 3. Configure environment
 
-Copy `.env.example` to `.env` and fill in any optional LLM keys or `yt-dlp` settings:
+Copy `.env.example` to `.env` and fill in any optional AI or `yt-dlp` settings:
 
 ```env
-# Optional Cloud LLM keys (multi-provider quota router)
+# Optional AI Moment Scoring (falls back cleanly to audio/heatmap/transcript scoring if omitted)
 GEMINI_API_KEY=
 GROQ_API_KEY=
 OPENROUTER_API_KEY=
 
-# Optional Local Ollama / Custom LLM
+# Optional Local Ollama
 OLLAMA_HOST=http://127.0.0.1:11434
 OLLAMA_MODEL=llama3.2:3b
-CUSTOM_LLM_URL=
-CUSTOM_LLM_MODEL=
-CUSTOM_LLM_KEY=
 
 # yt-dlp JavaScript runtime for YouTube extraction (defaults to node)
 YTDLP_JS_RUNTIME=node
 
-# YouTube cookies (use ONE of these if YouTube requests bot verification):
-# Option A (Recommended for cloud/headless): Upload cookies.txt in the Ingest UI ("YouTube Cookies")
+# YouTube cookies (use ONE if YouTube requests bot verification):
+# Option A (Recommended): Upload cookies.txt in the Discover Moments view ("YouTube Cookies")
 # Option B (Server file path):
 YTDLP_COOKIES_FILE=
-# Option C (Local desktop browser profile only):
+# Option C (Local desktop browser profile):
 YTDLP_COOKIES_FROM_BROWSER=
+
+# Optional custom storage folders (defaults to workspace/sources and workspace/renders)
+CLIPFORGE_SOURCES_DIR=
+CLIPFORGE_RENDERS_DIR=
 ```
 
 ### 4. Run the dev server
@@ -136,16 +106,6 @@ npm run dev
 ```
 
 Server listens on `http://0.0.0.0:3000`.
-
-### 5. Optional: Start the Custom LLM server
-
-You can toggle it directly from the **Ingest & Analyze** UI, or run it manually:
-
-```bash
-python3 custom_llm/server.py
-```
-
-See `custom_llm/README.md` for Ollama and 4-bit QLoRA fine-tuning setup.
 
 ## Scripts
 
@@ -160,7 +120,7 @@ See `custom_llm/README.md` for Ollama and 4-bit QLoRA fine-tuning setup.
 
 ## Notes
 
-- YouTube OAuth tokens are kept in browser memory only (never persisted to `localStorage`).
+- YouTube OAuth tokens stay in browser memory only (never persisted to `localStorage`).
 - Uploaded YouTube `cookies.txt` files are stored server-side at `workspace/ytdlp_cookies.txt` (`0600`), gitignored with `workspace/`, and never returned over API responses.
-- No burned captions are ever rendered into videos — YouTube auto-captions handle subtitles.
-- `firebase-applet-config.json` contains public Firebase Web SDK configuration for the Google Sign-In flow.
+- Rendered Shorts contain no burned-in subtitles—YouTube auto-captions handle subtitles cleanly.
+- `firebase-applet-config.json` contains public Firebase Web SDK configuration for Google Sign-In.

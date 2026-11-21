@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import path from 'node:path';
 import type {
   BrandingConfig,
   FacecamBox,
@@ -12,6 +11,7 @@ import type {
   ViralMoment,
 } from '../src/types.ts';
 import { detectNvencSupport } from './capabilities.ts';
+import { downloadMomentSegment1080p } from './ingest.ts';
 import {
   FRAMES_DIR,
   RENDERS_DIR,
@@ -127,7 +127,6 @@ function buildLayoutFilterGraph(
     return { filterSteps: steps, finalVideoLabel: 'vbase' };
   }
 
-  // blurred-bg-cam-top or blurred-bg-cam-bottom (clamped safely for any source aspect ratio)
   const rawFitH = even((OUT_WIDTH * srcHeight) / Math.max(1, srcWidth));
   const mainFitH = Math.min(OUT_HEIGHT - 40, rawFitH);
   const mainFitW =
@@ -234,53 +233,9 @@ function runFfmpegWithTimeout(args: string[], timeoutMs = 240000): Promise<void>
   });
 }
 
-async function resolveProjectSourceInputs(project: VideoProject): Promise<{
-  videoUrl: string;
-  audioUrl: string;
-  isSeparate: boolean;
-  isRemote: boolean;
-}> {
-  if (project.sourceDeleted) {
-    throw new Error(
-      'Source VOD was deleted from the folder to save storage. View your rendered Shorts in Render Queue or re-ingest the link to render more clips.'
-    );
-  }
-
-  if (project.sourceMode !== 'remote-stream') {
-    const srcPath = resolveSafeSourcePath(project.fileName);
-    if (fs.existsSync(srcPath)) {
-      return { videoUrl: srcPath, audioUrl: srcPath, isSeparate: false, isRemote: false };
-    }
-    throw new Error(
-      'Source VOD file was removed from workspace/sources. Re-ingest the source if you want to render additional clips.'
-    );
-  }
-
-  if (!project.sourceUrl) {
-    throw new Error('Source video file is missing from workspace.');
-  }
-
-  if (project.sourceType === 'direct') {
-    return {
-      videoUrl: project.sourceUrl,
-      audioUrl: project.sourceUrl,
-      isSeparate: false,
-      isRemote: true,
-    };
-  }
-
-  const resolved = await resolveStreamUrlsWithYtDlp(project.sourceUrl);
-  return {
-    videoUrl: resolved.videoUrl,
-    audioUrl: resolved.audioUrl,
-    isSeparate: resolved.isSeparate,
-    isRemote: true,
-  };
-}
-
 /**
- * Extracts and caches a lightweight 45s preview MP4 slice for remote-stream projects
- * so users can scrub and mark clips at any timestamp inside a 50-hour VOD.
+ * Extracts and caches a lightweight 45s preview MP4 slice so users can preview any
+ * AI-discovered moment or custom timestamp before downloading full 1080p segments.
  */
 export async function ensureRemotePreviewSegment(
   project: VideoProject,
@@ -297,56 +252,72 @@ export async function ensureRemotePreviewSegment(
     return outPath;
   }
 
-  const src = await resolveProjectSourceInputs(project);
-  const tmpPath = `${outPath}.${crypto.randomBytes(3).toString('hex')}.tmp.mp4`;
+  let videoIn = '';
+  let audioIn = '';
+  let isSep = false;
+  let isRem = false;
 
-  const buildPreviewArgs = (videoIn: string, audioIn: string, isSep: boolean, isRem: boolean) => {
-    const args: string[] = ['-y'];
-    const rec = isRem ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '4'] : [];
-    args.push(...rec, '-ss', safeStart.toFixed(2), '-t', safeDur.toFixed(2), '-i', videoIn);
-    if (isSep) {
-      args.push(...rec, '-ss', safeStart.toFixed(2), '-t', safeDur.toFixed(2), '-i', audioIn);
+  if (project.sourceMode === 'local') {
+    if (!project.fileName || project.sourceDeleted) {
+      throw new Error('Local source file is missing or pruned.');
     }
-    args.push('-map', '0:v:0');
-    if (project.hasAudio) {
-      args.push('-map', isSep ? '1:a:0?' : '0:a:0?', '-c:a', 'aac', '-b:a', '96k');
+    const localPath = resolveSafeSourcePath(project.fileName);
+    if (!fs.existsSync(localPath)) {
+      throw new Error('Local source file was deleted from workspace/sources.');
+    }
+    videoIn = localPath;
+    audioIn = localPath;
+  } else {
+    if (!project.sourceUrl) {
+      throw new Error('Source URL is missing from project.');
+    }
+    isRem = true;
+    if (project.sourceType === 'direct') {
+      videoIn = project.sourceUrl;
+      audioIn = project.sourceUrl;
     } else {
-      args.push('-an');
+      const resolved = await resolveStreamUrlsWithYtDlp(project.sourceUrl);
+      videoIn = resolved.videoUrl;
+      audioIn = resolved.audioUrl;
+      isSep = resolved.isSeparate;
     }
-    args.push(
-      '-vf',
-      'scale=854:-2',
-      '-c:v',
-      'libx264',
-      '-preset',
-      'ultrafast',
-      '-crf',
-      '26',
-      '-pix_fmt',
-      'yuv420p',
-      '-movflags',
-      '+faststart',
-      tmpPath
-    );
-    return args;
-  };
+  }
+
+  const tmpPath = `${outPath}.${crypto.randomBytes(3).toString('hex')}.tmp.mp4`;
+  const rec = isRem ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '4'] : [];
+  const args: string[] = ['-y', ...rec, '-ss', safeStart.toFixed(2), '-t', safeDur.toFixed(2), '-i', videoIn];
+  if (isSep) {
+    args.push(...rec, '-ss', safeStart.toFixed(2), '-t', safeDur.toFixed(2), '-i', audioIn);
+  }
+  args.push('-map', '0:v:0');
+  if (project.hasAudio) {
+    args.push('-map', isSep ? '1:a:0?' : '0:a:0?', '-c:a', 'aac', '-b:a', '96k');
+  } else {
+    args.push('-an');
+  }
+  args.push(
+    '-vf',
+    'scale=854:-2',
+    '-c:v',
+    'libx264',
+    '-preset',
+    'ultrafast',
+    '-crf',
+    '26',
+    '-pix_fmt',
+    'yuv420p',
+    '-movflags',
+    '+faststart',
+    tmpPath
+  );
 
   try {
-    await runFfmpegWithTimeout(
-      buildPreviewArgs(src.videoUrl, src.audioUrl, src.isSeparate, src.isRemote),
-      90000
-    );
+    await runFfmpegWithTimeout(args, 90000);
   } catch (err) {
-    if (src.isRemote && project.sourceUrl && project.sourceType !== 'direct') {
-      // Refresh expired URL or fallback to yt-dlp section download
-      const segTmp = path.join(FRAMES_DIR, `seg_${crypto.randomBytes(4).toString('hex')}.mp4`);
+    if (isRem && project.sourceUrl && project.sourceType !== 'direct') {
+      const segTmp = resolveSafeChildPath(FRAMES_DIR, `seg_${crypto.randomBytes(4).toString('hex')}.mp4`);
       try {
-        await downloadSegmentWithYtDlp(
-          project.sourceUrl,
-          safeStart,
-          safeStart + safeDur,
-          segTmp
-        );
+        await downloadSegmentWithYtDlp(project.sourceUrl, safeStart, safeStart + safeDur, segTmp);
         await runFfmpegWithTimeout(
           [
             '-y',
@@ -404,15 +375,64 @@ export async function renderVerticalClip(params: {
   descriptionOverride?: string;
   hashtagsOverride?: string[];
   onProgress?: (pct: number, stage: string, detail?: string) => void;
-}): Promise<RenderedClip> {
+}): Promise<{
+  clip: RenderedClip;
+  downloadedSegment?: { segmentFileName: string; segmentSizeBytes: number };
+}> {
   ensureWorkspace();
-  params.onProgress?.(10, 'Resolving source stream...');
-  const src = await resolveProjectSourceInputs(params.project);
+
+  let inputFilePath = '';
+  let useRelativeStart = false;
+  let downloadedSegment: { segmentFileName: string; segmentSizeBytes: number } | undefined;
+
+  if (params.project.sourceMode === 'local') {
+    if (params.project.sourceDeleted || !params.project.fileName) {
+      throw new Error(
+        'Local source file was pruned. Re-upload or select another project to render.'
+      );
+    }
+    inputFilePath = resolveSafeSourcePath(params.project.fileName);
+    if (!fs.existsSync(inputFilePath)) {
+      throw new Error('Local source file is missing from workspace/sources.');
+    }
+    useRelativeStart = false;
+  } else {
+    // Segment-only mode: use the downloaded 1080p segment on disk, or fetch ONLY this moment in 1080p now
+    let existingSegPath = '';
+    if (params.moment.segmentFileName && params.moment.segmentStatus === 'ready') {
+      try {
+        const candidate = resolveSafeSourcePath(params.moment.segmentFileName);
+        if (fs.existsSync(candidate) && fs.statSync(candidate).size > 4096) {
+          existingSegPath = candidate;
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (existingSegPath) {
+      inputFilePath = existingSegPath;
+      useRelativeStart = true;
+      params.onProgress?.(30, 'Using cached 1080p segment...');
+    } else {
+      params.onProgress?.(12, 'Downloading only this moment in 1080p MP4...');
+      const seg = await downloadMomentSegment1080p({
+        project: params.project,
+        moment: params.moment,
+        onProgress: (dlPct, detail) => {
+          const mapped = Math.round(12 + (dlPct / 100) * 38);
+          params.onProgress?.(mapped, 'Downloading 1080p segment...', detail);
+        },
+      });
+      downloadedSegment = seg;
+      inputFilePath = resolveSafeSourcePath(seg.segmentFileName);
+      useRelativeStart = true;
+    }
+  }
 
   const clipId = `clip_${crypto.randomBytes(5).toString('hex')}`;
   const outputFileName = `${clipId}.mp4`;
   const outPath = resolveSafeChildPath(RENDERS_DIR, outputFileName);
-
   const clipDuration = Math.max(2, Math.min(60, params.moment.endSec - params.moment.startSec));
   const hookTagline = params.hookTaglineOverride?.trim() || params.moment.hookTagline;
 
@@ -436,103 +456,62 @@ export async function renderVerticalClip(params: {
   const useNvenc = await detectNvencSupport();
   const encoderUsed: 'h264_nvenc' | 'libx264' = useNvenc ? 'h264_nvenc' : 'libx264';
 
-  const buildRenderArgs = (
-    videoIn: string,
-    audioIn: string,
-    isSep: boolean,
-    isRem: boolean,
-    useRelativeStart: boolean
-  ): string[] => {
-    const args: string[] = ['-y'];
-    const rec = isRem
-      ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
-      : [];
-
-    if (useRelativeStart) {
-      args.push('-i', videoIn, '-t', clipDuration.toFixed(2));
-    } else {
-      args.push(...rec, '-ss', params.moment.startSec.toFixed(2), '-t', clipDuration.toFixed(2), '-i', videoIn);
-      if (isSep) {
-        args.push(...rec, '-ss', params.moment.startSec.toFixed(2), '-t', clipDuration.toFixed(2), '-i', audioIn);
-      }
-    }
-
-    args.push('-filter_complex', allFilters.join(';'), '-map', `[${finalVideoLabel}]`);
-
-    if (params.project.hasAudio) {
-      args.push('-map', isSep && !useRelativeStart ? '1:a:0?' : '0:a:0?', '-c:a', 'aac', '-b:a', '128k');
-    } else {
-      args.push('-an');
-    }
-
-    if (useNvenc) {
-      args.push(
-        '-c:v',
-        'h264_nvenc',
-        '-preset',
-        'p4',
-        '-rc',
-        'vbr',
-        '-cq',
-        '23',
-        '-pix_fmt',
-        'yuv420p',
-        '-movflags',
-        '+faststart',
-        outPath
-      );
-    } else {
-      args.push(
-        '-c:v',
-        'libx264',
-        '-preset',
-        'veryfast',
-        '-crf',
-        '22',
-        '-pix_fmt',
-        'yuv420p',
-        '-movflags',
-        '+faststart',
-        outPath
-      );
-    }
-    return args;
-  };
-
-  params.onProgress?.(35, 'Rendering 9:16 vertical Short with FFmpeg...');
-
-  try {
-    await runFfmpegWithTimeout(
-      buildRenderArgs(src.videoUrl, src.audioUrl, src.isSeparate, src.isRemote, false),
-      240000
+  const args: string[] = ['-y'];
+  if (useRelativeStart) {
+    args.push('-i', inputFilePath, '-t', clipDuration.toFixed(2));
+  } else {
+    args.push(
+      '-ss',
+      params.moment.startSec.toFixed(2),
+      '-t',
+      clipDuration.toFixed(2),
+      '-i',
+      inputFilePath
     );
-  } catch (err) {
-    if (src.isRemote && params.project.sourceUrl && params.project.sourceType !== 'direct') {
-      // Fallback: download just the clipped segment via yt-dlp --download-sections, then render locally
-      params.onProgress?.(50, 'Extracting remote clip section via yt-dlp...');
-      const segTmp = path.join(RENDERS_DIR, `seg_${clipId}.mp4`);
-      try {
-        await downloadSegmentWithYtDlp(
-          params.project.sourceUrl,
-          params.moment.startSec,
-          params.moment.endSec,
-          segTmp
-        );
-        params.onProgress?.(75, 'Compositing 9:16 layout...');
-        await runFfmpegWithTimeout(buildRenderArgs(segTmp, segTmp, false, false, true), 180000);
-      } finally {
-        if (fs.existsSync(segTmp)) {
-          try {
-            fs.unlinkSync(segTmp);
-          } catch {
-            // ignore
-          }
-        }
-      }
-    } else {
-      throw err;
-    }
   }
+
+  args.push('-filter_complex', allFilters.join(';'), '-map', `[${finalVideoLabel}]`);
+
+  if (params.project.hasAudio) {
+    args.push('-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k');
+  } else {
+    args.push('-an');
+  }
+
+  if (useNvenc) {
+    args.push(
+      '-c:v',
+      'h264_nvenc',
+      '-preset',
+      'p4',
+      '-rc',
+      'vbr',
+      '-cq',
+      '23',
+      '-pix_fmt',
+      'yuv420p',
+      '-movflags',
+      '+faststart',
+      outPath
+    );
+  } else {
+    args.push(
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '22',
+      '-pix_fmt',
+      'yuv420p',
+      '-movflags',
+      '+faststart',
+      outPath
+    );
+  }
+
+  params.onProgress?.(60, 'Rendering 9:16 vertical Short via FFmpeg...');
+  await runFfmpegWithTimeout(args, 240000);
 
   if (!fs.existsSync(outPath)) {
     throw new Error('FFmpeg finished without writing output MP4.');
@@ -541,25 +520,28 @@ export async function renderVerticalClip(params: {
   const stat = fs.statSync(outPath);
 
   return {
-    id: clipId,
-    projectId: params.project.id,
-    momentId: params.moment.id,
-    title: params.titleOverride?.trim() || params.moment.title,
-    hookTagline,
-    description: params.descriptionOverride?.trim() || params.moment.description,
-    hashtags: params.hashtagsOverride?.length ? params.hashtagsOverride : params.moment.hashtags,
-    layoutId: params.layoutId,
-    templateId: params.templateId,
-    facecamBox: params.facecamBox,
-    branding: params.branding,
-    burnedCaptions: false,
-    encoderUsed,
-    outputFileName,
-    downloadUrl: `/api/renders/${outputFileName}`,
-    durationSec: Math.round(clipDuration * 10) / 10,
-    resolution: `${OUT_WIDTH}x${OUT_HEIGHT}`,
-    fileSizeBytes: stat.size,
-    createdAt: new Date().toISOString(),
-    youtubeStatus: 'ready',
+    clip: {
+      id: clipId,
+      projectId: params.project.id,
+      momentId: params.moment.id,
+      title: params.titleOverride?.trim() || params.moment.title,
+      hookTagline,
+      description: params.descriptionOverride?.trim() || params.moment.description,
+      hashtags: params.hashtagsOverride?.length ? params.hashtagsOverride : params.moment.hashtags,
+      layoutId: params.layoutId,
+      templateId: params.templateId,
+      facecamBox: params.facecamBox,
+      branding: params.branding,
+      burnedCaptions: false,
+      encoderUsed,
+      outputFileName,
+      downloadUrl: `/api/renders/${outputFileName}`,
+      durationSec: Math.round(clipDuration * 10) / 10,
+      resolution: `${OUT_WIDTH}x${OUT_HEIGHT}`,
+      fileSizeBytes: stat.size,
+      createdAt: new Date().toISOString(),
+      youtubeStatus: 'ready',
+    },
+    downloadedSegment,
   };
 }

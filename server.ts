@@ -7,22 +7,22 @@ import multer from 'multer';
 import { createServer as createViteServer } from 'vite';
 import type {
   BrandingConfig,
-  CreatorWatchItem,
   FacecamBox,
-  IngestStrategy,
   LayoutId,
   TemplateId,
   VideoProject,
   ViralMoment,
 } from './src/types.ts';
-import { analyzeVideoProject, findViralMoments } from './server/analyzer.ts';
-import { getSystemCapabilities } from './server/capabilities.ts';
 import {
-  probeCustomLlmHealth,
-  startLocalCustomLlm,
-  stopLocalCustomLlm,
-} from './server/customLlmManager.ts';
-import { generateSampleStreamVideo, ingestFromUrl } from './server/ingest.ts';
+  analyzeVideoProject,
+  computeFinalRankScore,
+  findViralMoments,
+} from './server/analyzer.ts';
+import {
+  downloadMomentSegment1080p,
+  generateSampleStreamVideo,
+  inspectFromUrl,
+} from './server/ingest.ts';
 import {
   canAutoPruneProject,
   completeJob,
@@ -32,17 +32,7 @@ import {
   getJob,
   updateJob,
 } from './server/jobs.ts';
-import {
-  clearRouterCooldowns,
-  getLLMRouterState,
-  setRoutingPriority,
-} from './server/llmRouter.ts';
 import { ensureRemotePreviewSegment, renderVerticalClip } from './server/renderer.ts';
-import {
-  TRAINING_DATASET_PATH,
-  getTrainingStats,
-  recordTrainingExample,
-} from './server/training.ts';
 import {
   FRAMES_DIR,
   RENDERS_DIR,
@@ -56,22 +46,14 @@ import {
   getStorageStatus,
   listClips,
   listProjects,
-  listWatchlist,
   loadAppSettings,
-  loadWeights,
   pruneAllDownloadedSources,
   resolveSafeChildPath,
   resolveSafeSourcePath,
   saveAppSettings,
   saveClip,
   saveProject,
-  saveWatchlist,
 } from './server/storage.ts';
-import {
-  applyMomentFeedback,
-  computeFinalRankScore,
-  resetRankingWeights,
-} from './server/weights.ts';
 import {
   clearCookiesFile,
   ensureYtDlp,
@@ -82,9 +64,8 @@ import {
 dotenv.config();
 ensureWorkspace();
 
-// Pre-warm standalone yt-dlp asynchronously in background so YouTube/Twitch/Kick links work immediately
 ensureYtDlp().catch(() => {
-  // Handled gracefully on demand in ingestFromUrl if offline at boot
+  // Auto-bootstraps on demand when a URL is inspected
 });
 
 const PORT = Number(process.env.PORT || 3000);
@@ -105,7 +86,7 @@ const upload = multer({
     },
   }),
   limits: {
-    fileSize: 100 * 1024 * 1024 * 1024, // 100 GB local video limit
+    fileSize: 100 * 1024 * 1024 * 1024,
   },
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname || '').toLowerCase();
@@ -127,15 +108,6 @@ async function startServer() {
 
   app.get('/favicon.ico', (_req, res) => {
     res.status(204).end();
-  });
-
-  app.get('/api/capabilities', async (_req, res) => {
-    try {
-      const caps = await getSystemCapabilities();
-      res.json(caps);
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to probe capabilities' });
-    }
   });
 
   app.get('/api/ytdlp/cookies/status', (_req, res) => {
@@ -185,14 +157,12 @@ async function startServer() {
 
     (async () => {
       try {
-        const weights = loadWeights();
         const project = await analyzeVideoProject({
           fileName: uploadedFile.filename,
           title: title.slice(0, 120),
           sourceType: 'local',
           sourceMode: 'local',
           transcriptText,
-          weights,
           onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
         });
         saveProject(project);
@@ -212,15 +182,19 @@ async function startServer() {
     res.status(202).json({ jobId: job.id, job });
   });
 
+  /**
+   * Step 1: Inspect URL remotely (0 video download). Pulls metadata, heatmaps,
+   * chapters, and auto-captions, then detects the top viral moments.
+   */
   app.post('/api/ingest/url', (req, res) => {
     const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
     const titleOverride = typeof req.body?.title === 'string' ? req.body.title.trim() : undefined;
-    const transcriptText =
-      typeof req.body?.transcriptText === 'string' ? req.body.transcriptText : undefined;
-    const ingestStrategy: IngestStrategy =
-      req.body?.ingestStrategy === 'remote-stream' ? 'remote-stream' : 'download-1080p';
+    const manualTranscript =
+      typeof req.body?.transcriptText === 'string' && req.body.transcriptText.trim()
+        ? req.body.transcriptText.trim()
+        : undefined;
     const downloadFolder =
-      typeof req.body?.downloadFolder === 'string' ? req.body.downloadFolder.trim() : undefined;
+      typeof req.body?.downloadFolder === 'string' ? req.body.downloadFolder.trim() : 'segments';
 
     if (!rawUrl) {
       return res.status(400).json({ error: 'Video URL is required.' });
@@ -228,46 +202,42 @@ async function startServer() {
 
     const job = createJob(
       'ingest-url',
-      ingestStrategy === 'download-1080p'
-        ? 'Preparing 1080p download to folder...'
-        : 'Connecting to remote stream...',
+      'Inspecting link for best moments (no full download)...',
       rawUrl.slice(0, 80)
     );
 
     (async () => {
       try {
-        const ingested = await ingestFromUrl(
+        const inspected = await inspectFromUrl(
           rawUrl,
           titleOverride,
           (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
-          { ingestStrategy, downloadFolder }
+          {
+            downloadFolder,
+            skipAutoTranscript: Boolean(manualTranscript),
+          }
         );
-        const weights = loadWeights();
+
+        const resolvedTranscript = manualTranscript || inspected.autoTranscriptText;
         const project = await analyzeVideoProject({
-          fileName: ingested.fileName,
-          title: ingested.title,
-          sourceType: ingested.platform,
-          sourceMode: ingested.sourceMode,
-          downloadFolder: ingested.downloadFolder,
+          title: inspected.title,
+          sourceType: inspected.platform,
+          sourceMode: 'segments',
+          downloadFolder: inspected.downloadFolder,
           sourceUrl: rawUrl,
-          streamUrls: ingested.streamUrls,
-          preProbed: ingested.preProbed,
-          chapters: ingested.chapters,
-          heatmap: ingested.heatmap,
-          transcriptText,
-          weights,
-          onProgress: (pct, stage, detail) => {
-            const mappedPct =
-              ingested.sourceMode === 'local'
-                ? Math.min(99, Math.round(52 + ((Math.max(24, pct) - 24) / 72) * 46))
-                : pct;
-            updateJob(job.id, { progress: mappedPct, stage, detail });
-          },
+          streamUrls: inspected.streamUrls,
+          preProbed: inspected.preProbed,
+          chapters: inspected.chapters,
+          heatmap: inspected.heatmap,
+          transcriptText: resolvedTranscript,
+          autoTranscriptFetched: Boolean(!manualTranscript && inspected.autoTranscriptText),
+          onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
         });
+
         saveProject(project);
         completeJob(job.id, { project });
       } catch (err) {
-        failJob(job.id, err instanceof Error ? err.message : 'URL ingest failed');
+        failJob(job.id, err instanceof Error ? err.message : 'Link inspection failed');
       }
     })();
 
@@ -288,14 +258,12 @@ async function startServer() {
         'Bro chat is going crazy, clip that right now before it disappears!',
       ].join('\n');
 
-      const weights = loadWeights();
       const project = await analyzeVideoProject({
         fileName: sample.fileName,
         title: sample.title,
         sourceType: sample.platform,
         sourceMode: 'local',
         transcriptText: sampleTranscript,
-        weights,
       });
 
       saveProject(project);
@@ -305,6 +273,146 @@ async function startServer() {
         .status(500)
         .json({ error: err instanceof Error ? err.message : 'Sample stream generation failed' });
     }
+  });
+
+  /**
+   * Step 2a: Select/deselect moments or refine their startSec/endSec/title before downloading in 1080p.
+   */
+  app.patch('/api/projects/:id/moments/:momentId', (req, res) => {
+    const project = getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    const target = project.moments.find((m) => m.id === req.params.momentId);
+    if (!target) return res.status(404).json({ error: 'Moment not found' });
+
+    const nextStart =
+      typeof req.body?.startSec === 'number'
+        ? Math.max(0, Math.min(project.durationSec - 2, Number(req.body.startSec)))
+        : target.startSec;
+    const nextEnd =
+      typeof req.body?.endSec === 'number'
+        ? Math.min(project.durationSec, Math.max(nextStart + 2, Number(req.body.endSec)))
+        : Math.max(nextStart + 2, target.endSec);
+
+    const boundsChanged =
+      Math.abs(nextStart - target.startSec) > 0.25 || Math.abs(nextEnd - target.endSec) > 0.25;
+
+    const updatedMoments = project.moments.map((m) => {
+      if (m.id !== target.id) return m;
+      return {
+        ...m,
+        startSec: Math.round(nextStart * 10) / 10,
+        endSec: Math.round(nextEnd * 10) / 10,
+        durationSec: Math.round((nextEnd - nextStart) * 10) / 10,
+        title:
+          typeof req.body?.title === 'string' && req.body.title.trim()
+            ? req.body.title.trim().slice(0, 90)
+            : m.title,
+        selected: typeof req.body?.selected === 'boolean' ? req.body.selected : m.selected,
+        segmentStatus:
+          boundsChanged && project.sourceMode === 'segments' ? ('pending' as const) : m.segmentStatus,
+        segmentFileName: boundsChanged ? undefined : m.segmentFileName,
+        segmentSizeBytes: boundsChanged ? 0 : m.segmentSizeBytes,
+      };
+    });
+
+    const updated = saveProject({ ...project, moments: updatedMoments });
+    res.json({ project: updated });
+  });
+
+  /**
+   * Step 2b: Download ONLY selected moments in 1080p MP4 into workspace/sources/<folder>/.
+   */
+  app.post('/api/projects/:id/download-segments', (req, res) => {
+    const project = getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    if (project.sourceMode !== 'segments' || !project.sourceUrl) {
+      return res.status(400).json({ error: 'Project is already backed by a local video file.' });
+    }
+
+    const requestedIds = Array.isArray(req.body?.momentIds)
+      ? (req.body.momentIds as string[])
+      : null;
+
+    const targetMoments = project.moments.filter((m) => {
+      if (requestedIds && requestedIds.length > 0) {
+        return requestedIds.includes(m.id);
+      }
+      return m.selected && m.segmentStatus !== 'ready';
+    });
+
+    if (targetMoments.length === 0) {
+      return res.json({ project, alreadyReady: true });
+    }
+
+    const job = createJob(
+      'download-segments',
+      `Downloading ${targetMoments.length} moment(s) in 1080p...`,
+      project.title,
+      { projectId: project.id }
+    );
+
+    (async () => {
+      try {
+        let currentProject = getProject(project.id) || project;
+
+        for (let i = 0; i < targetMoments.length; i++) {
+          const target = targetMoments[i];
+          updateJob(job.id, {
+            progress: Math.max(5, Math.round((i / targetMoments.length) * 100)),
+            stage: `Downloading clip ${i + 1}/${targetMoments.length} in 1080p...`,
+            detail: target.title,
+          });
+
+          try {
+            const seg = await downloadMomentSegment1080p({
+              project: currentProject,
+              moment: target,
+              onProgress: (dlPct, dlDetail) => {
+                const overall = Math.round(((i + dlPct / 100) / targetMoments.length) * 100);
+                updateJob(job.id, {
+                  progress: overall,
+                  stage: `Downloading clip ${i + 1}/${targetMoments.length} in 1080p...`,
+                  detail: dlDetail,
+                });
+              },
+            });
+
+            currentProject = saveProject({
+              ...currentProject,
+              moments: currentProject.moments.map((m) =>
+                m.id === target.id
+                  ? {
+                      ...m,
+                      segmentStatus: 'ready',
+                      segmentFileName: seg.segmentFileName,
+                      segmentSizeBytes: seg.segmentSizeBytes,
+                      segmentError: undefined,
+                    }
+                  : m
+              ),
+            });
+          } catch (segErr) {
+            const msg = segErr instanceof Error ? segErr.message : 'Segment download failed';
+            currentProject = saveProject({
+              ...currentProject,
+              moments: currentProject.moments.map((m) =>
+                m.id === target.id
+                  ? { ...m, segmentStatus: 'error', segmentError: msg }
+                  : m
+              ),
+            });
+            throw segErr;
+          }
+        }
+
+        completeJob(job.id, { project: currentProject });
+      } catch (err) {
+        failJob(job.id, err instanceof Error ? err.message : '1080p segment download failed');
+      }
+    })();
+
+    res.status(202).json({ jobId: job.id, job });
   });
 
   app.post('/api/projects/:id/reanalyze', async (req, res) => {
@@ -317,12 +425,11 @@ async function startServer() {
           ? req.body.transcriptText
           : project.transcriptText;
 
-      const weights = loadWeights();
       const moments = await findViralMoments(
         project.title,
         project.durationSec,
         project.audioEnergySeries,
-        weights,
+        project.sourceMode,
         transcriptText
       );
 
@@ -345,13 +452,22 @@ async function startServer() {
       const moment = project.moments.find((m) => m.id === req.params.momentId);
       if (!moment) return res.status(404).json({ error: 'Moment not found' });
 
+      // Serve downloaded 1080p segment directly if ready on disk
+      if (moment.segmentFileName && moment.segmentStatus === 'ready') {
+        const segPath = resolveSafeSourcePath(moment.segmentFileName);
+        if (fs.existsSync(segPath)) {
+          res.sendFile(segPath);
+          return;
+        }
+      }
+
       const previewDur = Math.min(55, Math.max(15, moment.durationSec + 8));
       const previewStart = Math.max(0, moment.startSec - 2);
       const previewPath = await ensureRemotePreviewSegment(project, previewStart, previewDur);
       res.sendFile(previewPath);
     } catch (err) {
       res.status(500).json({
-        error: err instanceof Error ? err.message : 'Could not prepare remote segment preview',
+        error: err instanceof Error ? err.message : 'Could not prepare segment preview',
       });
     }
   });
@@ -383,7 +499,7 @@ async function startServer() {
     const title =
       typeof req.body?.title === 'string' && req.body.title.trim()
         ? req.body.title.trim().slice(0, 90)
-        : `Manual Clip (${startSec.toFixed(1)}s – ${endSec.toFixed(1)}s)`;
+        : `Custom Clip (${startSec.toFixed(1)}s – ${endSec.toFixed(1)}s)`;
 
     const slice = project.audioEnergySeries.filter((p) => p.sec >= startSec && p.sec <= endSec);
     let peakDb = -18;
@@ -399,14 +515,15 @@ async function startServer() {
       avgNorm = nearest.normalized;
     }
 
-    const weights = loadWeights();
     const audioSpikeScore = Math.round(Math.min(0.99, Math.max(0.4, avgNorm + 0.15)) * 100) / 100;
     const transcriptScore = 0.72;
     const llmScore = 0.78;
-    const finalRankScore = computeFinalRankScore(
-      { audioSpikeScore, transcriptScore, llmScore, durationSec },
-      weights
-    );
+    const finalRankScore = computeFinalRankScore({
+      audioSpikeScore,
+      transcriptScore,
+      llmScore,
+      durationSec,
+    });
 
     const newMoment: ViralMoment = {
       id: `mom_${crypto.randomBytes(4).toString('hex')}`,
@@ -415,16 +532,18 @@ async function startServer() {
       durationSec,
       title,
       hookTagline: title,
-      description: `Manual live-clipped highlight from ${project.title}.`,
-      hashtags: ['#shorts', '#liveclip', '#highlights'],
+      description: `Manual clip from ${project.title}.`,
+      hashtags: ['#shorts', '#highlights'],
       audioPeakDb: peakDb,
       audioSpikeScore,
       transcriptScore,
       llmScore,
       finalRankScore,
-      reason: 'Manual timeline override / Live clip marker',
+      reason: 'Custom timestamp selection',
       transcriptSnippet: '',
-      feedback: null,
+      selected: true,
+      segmentStatus: project.sourceMode === 'local' ? 'ready' : 'pending',
+      segmentSizeBytes: 0,
     };
 
     const updated = saveProject({
@@ -456,30 +575,6 @@ async function startServer() {
     res.json({ project: updated });
   });
 
-  app.post('/api/projects/:id/moments/:momentId/feedback', (req, res) => {
-    const project = getProject(req.params.id);
-    if (!project) return res.status(404).json({ error: 'Project not found' });
-
-    const feedback = req.body?.feedback === 'up' || req.body?.feedback === 'down' ? req.body.feedback : null;
-    if (!feedback) return res.status(400).json({ error: 'feedback must be "up" or "down"' });
-
-    const targetMoment = project.moments.find((m) => m.id === req.params.momentId);
-    if (!targetMoment) return res.status(404).json({ error: 'Moment not found' });
-
-    const weights = applyMomentFeedback(targetMoment, feedback);
-    const trainingStats = recordTrainingExample(project.title, targetMoment, feedback);
-    const rerankedMoments = project.moments
-      .map((m) => ({
-        ...m,
-        feedback: m.id === targetMoment.id ? feedback : m.feedback,
-        finalRankScore: computeFinalRankScore(m, weights),
-      }))
-      .sort((a, b) => b.finalRankScore - a.finalRankScore);
-
-    const updated = saveProject({ ...project, moments: rerankedMoments });
-    res.json({ project: updated, weights, trainingStats });
-  });
-
   app.get('/api/storage/status', (_req, res) => {
     res.json(getStorageStatus());
   });
@@ -503,7 +598,7 @@ async function startServer() {
         storage: getStorageStatus(),
       });
     } catch {
-      res.status(400).json({ error: 'Could not clean up source file safely.' });
+      res.status(400).json({ error: 'Could not clean up source files safely.' });
     }
   });
 
@@ -511,66 +606,6 @@ async function startServer() {
     const ok = deleteProject(req.params.id);
     if (!ok) return res.status(404).json({ error: 'Project not found' });
     res.json({ ok: true });
-  });
-
-  app.get('/api/llm-router', async (_req, res) => {
-    try {
-      res.json(await getLLMRouterState());
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Router state error' });
-    }
-  });
-
-  app.post('/api/llm-router/priority', async (req, res) => {
-    const priority = req.body?.priority === 'local-first' ? 'local-first' : 'cloud-first';
-    setRoutingPriority(priority);
-    res.json(await getLLMRouterState());
-  });
-
-  app.post('/api/llm-router/reset-cooldowns', async (_req, res) => {
-    clearRouterCooldowns();
-    res.json(await getLLMRouterState());
-  });
-
-  app.get('/api/custom-llm/status', async (_req, res) => {
-    res.json({
-      customLlm: await probeCustomLlmHealth(),
-      trainingStats: getTrainingStats(),
-    });
-  });
-
-  app.post('/api/custom-llm/start', async (_req, res) => {
-    try {
-      const customLlm = await startLocalCustomLlm();
-      const routerState = await getLLMRouterState();
-      res.json({ customLlm, routerState });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to start Custom LLM' });
-    }
-  });
-
-  app.post('/api/custom-llm/stop', async (_req, res) => {
-    const customLlm = await stopLocalCustomLlm();
-    const routerState = await getLLMRouterState();
-    res.json({ customLlm, routerState });
-  });
-
-  app.get('/api/training/export', (_req, res) => {
-    if (!fs.existsSync(TRAINING_DATASET_PATH)) {
-      res.setHeader('Content-Type', 'application/x-ndjson');
-      res.setHeader('Content-Disposition', 'attachment; filename="clipforge-training-dataset.jsonl"');
-      res.send('');
-      return;
-    }
-    res.download(TRAINING_DATASET_PATH, 'clipforge-training-dataset.jsonl');
-  });
-
-  app.get('/api/weights', (_req, res) => {
-    res.json({ weights: loadWeights() });
-  });
-
-  app.post('/api/weights/reset', (_req, res) => {
-    res.json({ weights: resetRankingWeights() });
   });
 
   app.get('/api/settings', (_req, res) => {
@@ -613,19 +648,22 @@ async function startServer() {
     descriptionOverride?: string;
     hashtagsOverride?: string[];
   }) => {
-    const job = createJob('render', 'Queued for 9:16 FFmpeg render...', params.moment.title, {
+    const job = createJob('render', 'Queued for 1080p segment -> 9:16 Short...', params.moment.title, {
       status: 'queued',
       projectId: params.project.id,
       momentId: params.moment.id,
     });
 
     enqueueRenderTask(async () => {
-      updateJob(job.id, { status: 'running', progress: 5, stage: 'Starting 9:16 FFmpeg render...' });
+      updateJob(job.id, { status: 'running', progress: 5, stage: 'Preparing clip...' });
       try {
-        const latestProject = getProject(params.project.id) || params.project;
-        const clip = await renderVerticalClip({
+        let latestProject = getProject(params.project.id) || params.project;
+        const latestMoment =
+          latestProject.moments.find((m) => m.id === params.moment.id) || params.moment;
+
+        const { clip, downloadedSegment } = await renderVerticalClip({
           project: latestProject,
-          moment: params.moment,
+          moment: latestMoment,
           layoutId: params.layoutId,
           templateId: params.templateId,
           facecamBox: params.facecamBox,
@@ -636,17 +674,30 @@ async function startServer() {
           hashtagsOverride: params.hashtagsOverride,
           onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
         });
+
         saveClip(clip);
 
+        if (downloadedSegment) {
+          latestProject = saveProject({
+            ...latestProject,
+            moments: latestProject.moments.map((m) =>
+              m.id === latestMoment.id
+                ? {
+                    ...m,
+                    segmentStatus: 'ready',
+                    segmentFileName: downloadedSegment.segmentFileName,
+                    segmentSizeBytes: downloadedSegment.segmentSizeBytes,
+                  }
+                : m
+            ),
+          });
+        }
+
         let autoPruned = false;
-        let updatedProject: VideoProject | undefined;
+        let updatedProject: VideoProject | undefined = downloadedSegment ? latestProject : undefined;
         const settings = loadAppSettings();
-        if (
-          settings.autoPruneSourceVod &&
-          latestProject.sourceMode !== 'remote-stream' &&
-          !latestProject.sourceDeleted &&
-          canAutoPruneProject(latestProject.id, job.id)
-        ) {
+
+        if (settings.autoPruneSourceVod && canAutoPruneProject(latestProject.id, job.id)) {
           const pruned = cleanupProjectSource(latestProject.id);
           if (pruned.project) {
             autoPruned = true;
@@ -680,10 +731,6 @@ async function startServer() {
       creditText: String(req.body?.branding?.creditText || '@clipforge').slice(0, 40),
       backgroundHex: String(req.body?.branding?.backgroundHex || '#0B0D11').slice(0, 12),
       watermarkText: String(req.body?.branding?.watermarkText || '').slice(0, 40),
-      outroEnabled: Boolean(req.body?.branding?.outroEnabled),
-      outroSeconds: Number(req.body?.branding?.outroSeconds || 1.5),
-      musicVolume: Number(req.body?.branding?.musicVolume ?? 0),
-      musicTrackId: req.body?.branding?.musicTrackId || null,
     };
 
     const job = queueClipRenderJob({
@@ -715,13 +762,14 @@ async function startServer() {
     const requestedIds = Array.isArray(req.body?.momentIds)
       ? (req.body.momentIds as string[])
       : null;
+
     const targetMoments =
       requestedIds && requestedIds.length > 0
         ? project.moments.filter((m) => requestedIds.includes(m.id))
-        : project.moments;
+        : project.moments.filter((m) => m.selected);
 
     if (targetMoments.length === 0) {
-      return res.status(400).json({ error: 'No moments found to queue for rendering.' });
+      return res.status(400).json({ error: 'Select at least one moment to render.' });
     }
 
     const facecamBox = (req.body?.facecamBox as FacecamBox) || project.detectedFacecam;
@@ -729,10 +777,6 @@ async function startServer() {
       creditText: String(req.body?.branding?.creditText || '@clipforge').slice(0, 40),
       backgroundHex: String(req.body?.branding?.backgroundHex || '#0B0D11').slice(0, 12),
       watermarkText: String(req.body?.branding?.watermarkText || '').slice(0, 40),
-      outroEnabled: Boolean(req.body?.branding?.outroEnabled),
-      outroSeconds: Number(req.body?.branding?.outroSeconds || 1.5),
-      musicVolume: Number(req.body?.branding?.musicVolume ?? 0),
-      musicTrackId: req.body?.branding?.musicTrackId || null,
     };
 
     const jobs = targetMoments.map((moment) =>
@@ -790,41 +834,6 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  app.get('/api/watchlist', (_req, res) => {
-    res.json({ watchlist: listWatchlist() });
-  });
-
-  app.post('/api/watchlist', (req, res) => {
-    const creatorName = String(req.body?.creatorName || '').trim().slice(0, 60);
-    const channelUrl = String(req.body?.channelUrl || '').trim().slice(0, 240);
-    const platform =
-      req.body?.platform === 'twitch' || req.body?.platform === 'kick'
-        ? req.body.platform
-        : 'youtube';
-    if (!creatorName || !channelUrl) {
-      return res.status(400).json({ error: 'Creator name and channel URL are required.' });
-    }
-    const item: CreatorWatchItem = {
-      id: `watch_${crypto.randomBytes(4).toString('hex')}`,
-      creatorName,
-      platform,
-      channelUrl,
-      autoClipEnabled: req.body?.autoClipEnabled !== false,
-      defaultLayoutId: (req.body?.defaultLayoutId || 'split-top-cam') as LayoutId,
-      minScoreThreshold: Math.min(0.95, Math.max(0.3, Number(req.body?.minScoreThreshold ?? 0.65))),
-      lastCheckedAt: new Date().toISOString(),
-    };
-    const next = [item, ...listWatchlist()];
-    saveWatchlist(next);
-    res.status(201).json({ item, watchlist: next });
-  });
-
-  app.delete('/api/watchlist/:id', (req, res) => {
-    const next = listWatchlist().filter((w) => w.id !== req.params.id);
-    saveWatchlist(next);
-    res.json({ watchlist: next });
-  });
-
   // Safe static media routes (path-confined)
   app.get('/api/frames/:filename', (req, res) => {
     try {
@@ -861,7 +870,10 @@ async function startServer() {
     }
   });
 
-  // Frontend Vite middleware (dev) or static dist (production)
+  app.all('/api/*', (_req, res) => {
+    res.status(404).json({ error: 'API route not found' });
+  });
+
   if (!isProduction) {
     const vite = await createViteServer({
       server: { middlewareMode: true },

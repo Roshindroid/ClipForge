@@ -32,26 +32,29 @@ export function RenderQueueView({
 }: RenderQueueViewProps) {
   const [busyId, setBusyId] = useState<string | null>(null);
 
-  const activeLocalVods = projects.filter(
-    (p) => p.sourceMode !== 'remote-stream' && !p.sourceDeleted && (p.sourceSizeBytes || 0) > 0
-  );
+  const projectsWithCachedSources = projects.filter((p) => {
+    if (p.sourceMode === 'local') {
+      return !p.sourceDeleted && (p.sourceSizeBytes || 0) > 0;
+    }
+    return p.moments.some((m) => m.segmentStatus === 'ready' && (m.segmentSizeBytes || 0) > 0);
+  });
 
   const storagePanel =
-    activeLocalVods.length > 0 || (storageStatus && storageStatus.totalSourceBytes > 0) ? (
+    projectsWithCachedSources.length > 0 || (storageStatus && storageStatus.totalSourceBytes > 0) ? (
       <div className="bg-[#13161D] border border-[#232834] rounded-xl p-4 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-start gap-2.5">
             <HardDrive className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
             <div>
               <h3 className="font-display text-sm font-semibold text-[#F4F5F7]">
-                Downloaded Source VODs on Disk ({formatBytes(storageStatus?.totalSourceBytes || 0)})
+                Cached 1080p Segments on Disk ({formatBytes(storageStatus?.totalSourceBytes || 0)})
               </h3>
               <p className="text-xs text-[#94A3B8] mt-0.5">
-                Delete downloaded VODs from <span className="font-mono text-[#CBD5E1]">workspace/sources</span> once your Shorts are generated — your rendered 9:16 clips in <span className="font-mono text-[#CBD5E1]">workspace/renders</span> stay intact.
+                Delete temporary 1080p segments from <span className="font-mono text-[#CBD5E1]">workspace/sources</span> anytime—your finished 9:16 Shorts in <span className="font-mono text-[#CBD5E1]">workspace/renders</span> remain intact.
               </p>
             </div>
           </div>
-          {activeLocalVods.length > 1 && (
+          {projectsWithCachedSources.length > 1 && (
             <button
               type="button"
               disabled={busyId !== null}
@@ -65,47 +68,60 @@ export function RenderQueueView({
               }}
               className="px-3 py-1.5 text-xs font-semibold bg-amber-500/15 hover:bg-rose-950/70 border border-amber-500/40 hover:border-rose-700 text-amber-200 rounded-lg transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
             >
-              {busyId === 'all' ? 'Deleting All VODs...' : 'Delete All Downloaded VODs'}
+              {busyId === 'all' ? 'Deleting...' : 'Delete All Segments'}
             </button>
           )}
         </div>
 
-        {activeLocalVods.length > 0 && (
+        {projectsWithCachedSources.length > 0 && (
           <div className="divide-y divide-[#232834] border-t border-[#232834] pt-2">
-            {activeLocalVods.map((vod) => (
-              <div
-                key={vod.id}
-                className="py-2 flex flex-wrap items-center justify-between gap-3 text-xs"
-              >
-                <div className="min-w-0 flex-1">
-                  <p className="font-medium text-[#F4F5F7] truncate">{vod.title}</p>
-                  <p className="text-[11px] font-mono text-[#64748B] truncate flex items-center gap-1.5 mt-0.5">
-                    <FolderOpen className="w-3 h-3 shrink-0" />
-                    <span>workspace/sources/{vod.fileName}</span>
-                    <span>·</span>
-                    <span className="text-[#94A3B8]">{formatBytes(vod.sourceSizeBytes || 0)}</span>
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  disabled={busyId !== null}
-                  onClick={async () => {
-                    setBusyId(vod.id);
-                    try {
-                      await onCleanupSource(vod.id);
-                    } finally {
-                      setBusyId(null);
-                    }
-                  }}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#1C212C] hover:bg-rose-950/60 border border-[#32394A] hover:border-rose-700 text-amber-300 rounded-lg transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+            {projectsWithCachedSources.map((proj) => {
+              const totalProjBytes =
+                proj.sourceMode === 'local'
+                  ? proj.sourceSizeBytes || 0
+                  : proj.moments.reduce((sum, m) => sum + (m.segmentSizeBytes || 0), 0);
+              const segCount =
+                proj.sourceMode === 'local'
+                  ? 1
+                  : proj.moments.filter((m) => m.segmentStatus === 'ready').length;
+
+              return (
+                <div
+                  key={proj.id}
+                  className="py-2 flex flex-wrap items-center justify-between gap-3 text-xs"
                 >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  {busyId === vod.id
-                    ? 'Deleting...'
-                    : `Delete VOD (Free ${formatBytes(vod.sourceSizeBytes || 0)})`}
-                </button>
-              </div>
-            ))}
+                  <div className="min-w-0 flex-1">
+                    <p className="font-medium text-[#F4F5F7] truncate">{proj.title}</p>
+                    <p className="text-[11px] font-mono text-[#64748B] truncate flex items-center gap-1.5 mt-0.5">
+                      <FolderOpen className="w-3 h-3 shrink-0" />
+                      <span>
+                        {proj.sourceMode === 'local'
+                          ? `workspace/sources/${proj.fileName}`
+                          : `${segCount} 1080p segment(s) in workspace/sources/${proj.downloadFolder || 'segments'}`}
+                      </span>
+                      <span>·</span>
+                      <span className="text-[#94A3B8]">{formatBytes(totalProjBytes)}</span>
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={busyId !== null}
+                    onClick={async () => {
+                      setBusyId(proj.id);
+                      try {
+                        await onCleanupSource(proj.id);
+                      } finally {
+                        setBusyId(null);
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#1C212C] hover:bg-rose-950/60 border border-[#32394A] hover:border-rose-700 text-amber-300 rounded-lg transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    {busyId === proj.id ? 'Deleting...' : `Free ${formatBytes(totalProjBytes)}`}
+                  </button>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -118,17 +134,17 @@ export function RenderQueueView({
         <div className="bg-[#13161D] border border-[#232834] rounded-xl p-12 text-center space-y-3">
           <Film className="w-7 h-7 text-[#64748B] mx-auto" />
           <h3 className="font-display text-base font-semibold text-[#F4F5F7]">
-            No Rendered Vertical Clips Yet
+            No Rendered Vertical Shorts Yet
           </h3>
           <p className="text-sm text-[#94A3B8] max-w-md mx-auto">
-            Select a viral moment and choose your facecam placement in the Facecam & Layouts studio to render a 9:16 MP4.
+            Pick your moments in Discover Moments and choose your 9:16 layout in Layout & Render.
           </p>
           <button
             type="button"
             onClick={onGoToStudio}
             className="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-500 text-white rounded-lg cursor-pointer"
           >
-            Open Facecam & Layouts
+            Open Layout Studio
           </button>
         </div>
       </div>
@@ -145,7 +161,7 @@ export function RenderQueueView({
             Rendered 9:16 Shorts ({clips.length})
           </h2>
           <p className="text-xs text-[#94A3B8] mt-0.5">
-            Saved in <span className="font-mono text-[#CBD5E1]">workspace/renders</span> ({formatBytes(storageStatus?.totalRenderBytes || 0)} total). All renders omit burned captions so YouTube auto-captions stay crisp.
+            Saved in <span className="font-mono text-[#CBD5E1]">workspace/renders</span> ({formatBytes(storageStatus?.totalRenderBytes || 0)} total).
           </p>
         </div>
       </div>
@@ -176,7 +192,7 @@ export function RenderQueueView({
                   {clip.title}
                 </h3>
                 <p className="text-xs text-[#94A3B8]">
-                  Layout: {layoutMeta?.name || clip.layoutId} · {clip.encoderUsed || 'libx264'} · Captions: None
+                  {layoutMeta?.name || clip.layoutId} · {clip.encoderUsed || 'libx264'}
                 </p>
                 {clip.youtubeVideoId && (
                   <p className="text-xs text-emerald-400 font-mono pt-0.5">
