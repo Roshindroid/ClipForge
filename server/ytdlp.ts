@@ -11,9 +11,11 @@ import { WORKSPACE_ROOT, ensureWorkspace } from './storage.ts';
 const execFileAsync = promisify(execFile);
 
 const BIN_DIR = path.join(WORKSPACE_ROOT, 'bin');
-const LOCAL_YTDLP_PATH = path.join(BIN_DIR, 'yt-dlp');
+const LOCAL_YTDLP_PATH = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 export const WORKSPACE_COOKIES_PATH = path.join(WORKSPACE_ROOT, 'ytdlp_cookies.txt');
-const YTDLP_ZIPAPP_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+const YTDLP_ZIPAPP_URL = process.platform === 'win32'
+  ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+  : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
 
 let installPromise: Promise<string> | null = null;
 
@@ -81,8 +83,20 @@ export async function ensureYtDlp(): Promise<string> {
       const tmpPath = `${LOCAL_YTDLP_PATH}.tmp`;
       const bodyStream = Readable.fromWeb(res.body as unknown as import('node:stream/web').ReadableStream);
       await pipeline(bodyStream, fs.createWriteStream(tmpPath));
-      fs.chmodSync(tmpPath, 0o755);
-      fs.renameSync(tmpPath, LOCAL_YTDLP_PATH);
+      if (process.platform !== 'win32') {
+        fs.chmodSync(tmpPath, 0o755);
+      }
+      // On Windows, use copy + unlink to avoid EPERM from OneDrive/locks
+      if (process.platform === 'win32') {
+        if (fs.existsSync(LOCAL_YTDLP_PATH)) {
+          try { fs.unlinkSync(LOCAL_YTDLP_PATH); } catch {}
+        }
+        // Copy instead of rename to avoid EPERM on synced folders
+        fs.copyFileSync(tmpPath, LOCAL_YTDLP_PATH);
+        try { fs.unlinkSync(tmpPath); } catch {}
+      } else {
+        fs.renameSync(tmpPath, LOCAL_YTDLP_PATH);
+      }
       await execFileAsync(LOCAL_YTDLP_PATH, ['--version'], { timeout: 4000 });
       return LOCAL_YTDLP_PATH;
     } finally {

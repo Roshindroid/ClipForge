@@ -834,11 +834,20 @@ export async function findViralMoments(
     });
   }
 
-  const maxMoments = durationSec >= 3600 ? 8 : 4;
-  const minSeparation =
-    durationSec >= 3600
-      ? Math.max(45, Math.floor(durationSec / 24))
-      : Math.max(2, Math.min(25, durationSec * 0.2));
+  const isLongVideo = durationSec >= 10800; // 3+ hours
+  const isMediumVideo = durationSec >= 3600; // 1-3 hours
+
+  const maxMoments = isLongVideo
+    ? Math.min(40, Math.max(30, Math.floor(durationSec / 300))) // 30-40 for 3+ hours
+    : isMediumVideo
+      ? Math.min(25, Math.max(15, Math.floor(durationSec / 200))) // 15-25 for 1-3 hours
+      : Math.min(15, Math.max(10, Math.floor(durationSec / 60))); // 10-15 for < 1 hour
+
+  const minSeparation = isLongVideo
+    ? Math.max(60, Math.floor(durationSec / maxMoments * 0.8))
+    : isMediumVideo
+      ? Math.max(45, Math.floor(durationSec / maxMoments * 0.8))
+      : Math.max(10, Math.floor(durationSec / maxMoments * 0.8));
 
   windows.sort((a, b) => b.audioSpikeScore - a.audioSpikeScore);
   const picked: WindowSpikeSample[] = [];

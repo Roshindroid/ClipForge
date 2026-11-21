@@ -64,6 +64,14 @@ import {
 dotenv.config();
 ensureWorkspace();
 
+// Ensure ffmpeg is in PATH (Windows: add BtbN FFmpeg build path)
+if (process.platform === 'win32') {
+  const ffmpegPath = 'C:\\Users\\roshi\\AppData\\Local\\Temp\\ffmpeg\\ffmpeg-master-latest-win64-gpl-shared\\bin';
+  if (!process.env.PATH.includes(ffmpegPath)) {
+    process.env.PATH = ffmpegPath + ';' + process.env.PATH;
+  }
+}
+
 ensureYtDlp().catch(() => {
   // Auto-bootstraps on demand when a URL is inspected
 });

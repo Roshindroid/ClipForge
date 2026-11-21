@@ -7,4 +7,10 @@ coverage/
 .env*
 !.env.example
 workspace/
+workspace/bin/yt-dlp
+workspace/bin/yt-dlp.exe
+*.tmp
 clipforge.zip
+server.js
+.vite/
+tsconfig.tsbuildinfo

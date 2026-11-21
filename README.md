@@ -10,6 +10,18 @@ ClipForge finds viral moments from short clips or 50-hour+ streams **before down
 4. **Layout, Render & Auto-Prune**: Frame your facecam across 11 vertical layouts, optionally add a clean header template (X Post, TikTok Hook, Breaking News—no burned captions), batch render 720×1280 H.264 Shorts, and optionally enable **Auto-Prune Segments After Render** to remove temporary 1080p source segments once all queued renders succeed.
 5. **Publish to YouTube**: Sign in with Google OAuth (tokens kept in browser memory only) and upload or schedule Shorts directly via YouTube Data API v3.
 
+## Smart Clip Generation
+
+ClipForge automatically detects the optimal number of viral moments based on video duration:
+
+| Video Duration | Clips Generated | Min Separation |
+|----------------|-----------------|----------------|
+| **> 3 hours** (10,800s+) | **30–40 clips** | ~duration/clips × 0.8 |
+| **1–3 hours** (3,600–10,800s) | **15–25 clips** | ~duration/clips × 0.8 |
+| **< 1 hour** | **10–15 clips** (min 10) | ~duration/clips × 0.8 |
+
+This ensures comprehensive coverage for long streams while keeping shorter videos focused.
+
 ## Tech Stack
 
 - **Frontend**: React 19, TypeScript, Tailwind CSS 4, Vite 8, Motion, Lucide React
@@ -58,11 +70,14 @@ ClipForge/
 
 ClipForge requires **FFmpeg** and **ffprobe** on `PATH`.
 
-- **Windows**: `winget install ffmpeg`
+- **Windows**: 
+  - FFmpeg: Download from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (extract `bin/ffmpeg.exe`, `bin/ffprobe.exe` to a folder in PATH)
+  - Or use Chocolatey: `choco install ffmpeg -y`
+  - Or winget: `winget install Gyan.FFmpeg`
 - **macOS**: `brew install ffmpeg yt-dlp`
 - **Linux**: `sudo apt install ffmpeg python3`
 
-`yt-dlp` is optional to install globally — if missing from `PATH`, ClipForge automatically downloads the official standalone `yt-dlp` zipapp to `workspace/bin/yt-dlp` on first URL inspection.
+`yt-dlp` is optional to install globally — if missing from `PATH`, ClipForge automatically downloads the official standalone `yt-dlp` zipapp to `workspace/bin/yt-dlp` (or `yt-dlp.exe` on Windows) on first URL inspection.
 
 ### 2. Install Node dependencies
 
@@ -124,3 +139,5 @@ Server listens on `http://0.0.0.0:3000`.
 - Uploaded YouTube `cookies.txt` files are stored server-side at `workspace/ytdlp_cookies.txt` (`0600`), gitignored with `workspace/`, and never returned over API responses.
 - Rendered Shorts contain no burned-in subtitles—YouTube auto-captions handle subtitles cleanly.
 - `firebase-applet-config.json` contains public Firebase Web SDK configuration for Google Sign-In.
+- On Windows, FFmpeg and yt-dlp binaries are auto-located in `workspace/bin/` if not on system PATH.
+- The `workspace/` directory is gitignored and contains all runtime data (sources, renders, frames, cookies, JSON).
