@@ -1,0 +1,21 @@
+# Python requirements for ClipForge Custom LLM server
+
+# Base runtime: custom_llm/server.py works with Python 3 standard library only.
+# These packages are optional and only needed for advanced backends / fine-tuning.
+
+# llama.cpp GGUF inference (CUDA offload to GTX 1650, 4 GB VRAM)
+# NOTE: requires C++ build tools (Visual Studio Build Tools) to compile from source on Windows.
+# Optional — server.py works without it via the built-in trainable classifier or Ollama.
+# llama-cpp-python>=0.3.0
+
+# 4-bit QLoRA fine-tuning on 4 GB VRAM GPUs
+torch>=2.3.0
+transformers>=4.44.0
+datasets>=2.20.0
+peft>=0.12.0
+trl>=0.9.6
+bitsandbytes>=0.43.0
+accelerate>=0.33.0
+
+# Install fine-tuning deps only when needed:
+#   pip install -r requirements.txt

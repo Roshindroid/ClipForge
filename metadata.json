@@ -1,0 +1,6 @@
+{
+  "name": "ClipForge",
+  "description": "Local open-source video clipping engine that extracts viral moments via audio spikes and local LLM scoring, detects facecam regions, renders captionless 9:16 FFmpeg Shorts across 11 layouts, and uploads directly to YouTube.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

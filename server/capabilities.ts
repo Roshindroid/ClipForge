@@ -1,0 +1,97 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import type { SystemCapabilities } from '../src/types.ts';
+import { ensureWorkspace } from './storage.ts';
+
+const execFileAsync = promisify(execFile);
+
+let cachedNvencSupport: boolean | null = null;
+
+async function checkBinary(cmd: string, args: string[]): Promise<boolean> {
+  try {
+    await execFileAsync(cmd, args, { timeout: 2500 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Probes whether an actual NVIDIA NVENC hardware encoder works at runtime
+ * (not just whether h264_nvenc is compiled into FFmpeg).
+ */
+export async function detectNvencSupport(): Promise<boolean> {
+  if (cachedNvencSupport !== null) return cachedNvencSupport;
+  try {
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-v',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'color=c=black:s=256x256:d=0.1',
+        '-vframes',
+        '1',
+        '-c:v',
+        'h264_nvenc',
+        '-f',
+        'null',
+        '-',
+      ],
+      { timeout: 4000 }
+    );
+    cachedNvencSupport = true;
+  } catch {
+    cachedNvencSupport = false;
+  }
+  return cachedNvencSupport;
+}
+
+export function getOllamaHost(): string {
+  const raw = process.env.OLLAMA_HOST?.trim() || 'http://127.0.0.1:11434';
+  return raw.replace(/\/+$/, '');
+}
+
+export async function checkOllama(): Promise<{
+  available: boolean;
+  host: string;
+  models: string[];
+}> {
+  const host = getOllamaHost();
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1200);
+    const res = await fetch(`${host}/api/tags`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) {
+      return { available: false, host, models: [] };
+    }
+    const data = (await res.json()) as { models?: Array<{ name: string }> };
+    const models = Array.isArray(data.models) ? data.models.map((m) => m.name) : [];
+    return { available: true, host, models };
+  } catch {
+    return { available: false, host, models: [] };
+  }
+}
+
+export async function getSystemCapabilities(): Promise<SystemCapabilities> {
+  ensureWorkspace();
+  const [ffmpeg, ffprobe, nvenc, ytdlp, ollama] = await Promise.all([
+    checkBinary('ffmpeg', ['-version']),
+    checkBinary('ffprobe', ['-version']),
+    detectNvencSupport(),
+    checkBinary('yt-dlp', ['--version']),
+    checkOllama(),
+  ]);
+
+  return {
+    ffmpeg,
+    ffprobe,
+    nvenc,
+    ytdlp,
+    ollama,
+    workspaceReady: true,
+  };
+}

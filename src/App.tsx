@@ -1,0 +1,370 @@
+import { useEffect, useState } from 'react';
+import {
+  Camera,
+  Film,
+  Scissors,
+  Youtube,
+} from 'lucide-react';
+import type {
+  CreatorWatchItem,
+  CustomLLMStatus,
+  LLMRouterState,
+  RankingWeights,
+  RenderedClip,
+  SystemCapabilities,
+  TrainingDatasetStats,
+  VideoProject,
+  ViralMoment,
+} from './types';
+import { IngestAnalyzeView } from './components/IngestAnalyzeView';
+import { FacecamLayoutStudio } from './components/FacecamLayoutStudio';
+import { RenderQueueView } from './components/RenderQueueView';
+import { YouTubePublishView } from './components/YouTubePublishView';
+import type { YouTubeChannelProfile } from './lib/youtubeAuth';
+
+type WorkspaceTab = 'ingest' | 'facecam' | 'queue' | 'youtube';
+
+const NAV_ITEMS: Array<{ id: WorkspaceTab; label: string; icon: typeof Scissors }> = [
+  { id: 'ingest', label: 'Ingest & Analyze', icon: Scissors },
+  { id: 'facecam', label: 'Facecam & Layouts', icon: Camera },
+  { id: 'queue', label: 'Render Queue', icon: Film },
+  { id: 'youtube', label: 'YouTube Publish', icon: Youtube },
+];
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>('ingest');
+  const [capabilities, setCapabilities] = useState<SystemCapabilities | null>(null);
+  const [projects, setProjects] = useState<VideoProject[]>([]);
+  const [activeProject, setActiveProject] = useState<VideoProject | null>(null);
+  const [selectedMoment, setSelectedMoment] = useState<ViralMoment | null>(null);
+  const [clips, setClips] = useState<RenderedClip[]>([]);
+  const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const [weights, setWeights] = useState<RankingWeights | null>(null);
+  const [watchlist, setWatchlist] = useState<CreatorWatchItem[]>([]);
+  const [routerState, setRouterState] = useState<LLMRouterState | null>(null);
+  const [customLlm, setCustomLlm] = useState<CustomLLMStatus | null>(null);
+  const [trainingStats, setTrainingStats] = useState<TrainingDatasetStats | null>(null);
+  const [connectedChannel, setConnectedChannel] = useState<YouTubeChannelProfile | null>(null);
+  const [loadingInitial, setLoadingInitial] = useState(true);
+
+  useEffect(() => {
+    let mounted = true;
+    Promise.all([
+      fetch('/api/capabilities').then((r) => r.json()),
+      fetch('/api/projects').then((r) => r.json()),
+      fetch('/api/clips').then((r) => r.json()),
+      fetch('/api/weights').then((r) => r.json()),
+      fetch('/api/watchlist').then((r) => r.json()),
+      fetch('/api/llm-router').then((r) => r.json()),
+      fetch('/api/custom-llm/status').then((r) => r.json()),
+    ])
+      .then(([capsRes, projRes, clipsRes, weightsRes, watchRes, routerRes, customRes]) => {
+        if (!mounted) return;
+        setCapabilities(capsRes);
+        const loadedProjects: VideoProject[] = projRes.projects || [];
+        setProjects(loadedProjects);
+        if (loadedProjects.length > 0) {
+          setActiveProject(loadedProjects[0]);
+          setSelectedMoment(loadedProjects[0].moments[0] || null);
+        }
+        const loadedClips: RenderedClip[] = clipsRes.clips || [];
+        setClips(loadedClips);
+        if (loadedClips.length > 0) {
+          setSelectedClipId(loadedClips[0].id);
+        }
+        setWeights(weightsRes.weights || null);
+        setWatchlist(watchRes.watchlist || []);
+        setRouterState(routerRes || null);
+        setCustomLlm(customRes?.customLlm || null);
+        setTrainingStats(customRes?.trainingStats || null);
+      })
+      .finally(() => {
+        if (mounted) setLoadingInitial(false);
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const handleProjectCreated = (project: VideoProject) => {
+    setProjects((prev) => [project, ...prev]);
+    setActiveProject(project);
+    setSelectedMoment(project.moments[0] || null);
+  };
+
+  const handleProjectUpdated = (updated: VideoProject) => {
+    setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+    if (activeProject?.id === updated.id) {
+      setActiveProject(updated);
+      if (selectedMoment) {
+        const refreshed = updated.moments.find((m) => m.id === selectedMoment.id);
+        setSelectedMoment(refreshed || updated.moments[0] || null);
+      } else {
+        setSelectedMoment(updated.moments[0] || null);
+      }
+    }
+  };
+
+  const handleProjectDeleted = async (projectId: string) => {
+    const res = await fetch(`/api/projects/${projectId}`, { method: 'DELETE' });
+    if (res.ok) {
+      const remaining = projects.filter((p) => p.id !== projectId);
+      setProjects(remaining);
+      if (activeProject?.id === projectId) {
+        const next = remaining[0] || null;
+        setActiveProject(next);
+        setSelectedMoment(next?.moments[0] || null);
+      }
+    }
+  };
+
+  const handleClipRendered = (clip: RenderedClip) => {
+    setClips((prev) => [clip, ...prev]);
+    setSelectedClipId(clip.id);
+    setActiveTab('queue');
+  };
+
+  const handleClipDeleted = async (clipId: string) => {
+    const res = await fetch(`/api/clips/${clipId}`, { method: 'DELETE' });
+    if (res.ok) {
+      const remaining = clips.filter((c) => c.id !== clipId);
+      setClips(remaining);
+      if (selectedClipId === clipId) {
+        setSelectedClipId(remaining[0]?.id || null);
+      }
+    }
+  };
+
+  const handleClipUpdated = (updated: RenderedClip) => {
+    setClips((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+  };
+
+  const activeNavMeta = NAV_ITEMS.find((n) => n.id === activeTab) || NAV_ITEMS[0];
+
+  return (
+    <div className="min-h-screen flex flex-col lg:flex-row bg-[#0B0D11] text-[#F4F5F7]">
+      {/* Left Sidebar Navigation */}
+      <aside className="w-full lg:w-[248px] shrink-0 bg-[#10131A] border-b lg:border-b-0 lg:border-r border-[#232834] flex flex-col justify-between p-4">
+        <div className="space-y-6">
+          <div className="px-2 pt-1">
+            <a
+              href="/"
+              onClick={(e) => {
+                e.preventDefault();
+                setActiveTab('ingest');
+              }}
+              className="font-display text-xl font-bold tracking-tight text-[#F4F5F7] whitespace-nowrap shrink-0"
+            >
+              ClipForge
+            </a>
+          </div>
+
+          <nav className="flex lg:flex-col gap-1 overflow-x-auto pb-1 lg:pb-0">
+            {NAV_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const isActive = activeTab === item.id;
+              const countBadge =
+                item.id === 'queue' && clips.length > 0
+                  ? `${clips.length}`
+                  : item.id === 'ingest' && projects.length > 0
+                    ? `${projects.length}`
+                    : null;
+
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setActiveTab(item.id)}
+                  className={`flex items-center justify-between gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    isActive
+                      ? 'bg-[#1B202C] text-[#F4F5F7]'
+                      : 'text-[#94A3B8] hover:text-[#F4F5F7] hover:bg-[#161A24]'
+                  }`}
+                >
+                  <span className="flex items-center gap-2.5">
+                    <Icon className={`w-4 h-4 ${isActive ? 'text-rose-500' : 'text-[#64748B]'}`} />
+                    <span>{item.label}</span>
+                  </span>
+                  {countBadge && (
+                    <span className="text-xs font-mono tabular-nums text-[#94A3B8]">
+                      {countBadge}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+
+        {/* Local Pipeline Environment Summary */}
+        <div className="hidden lg:block pt-4 mt-6 border-t border-[#232834] px-2 space-y-2 text-xs">
+          <div className="font-medium text-[#CBD5E1]">Local Engine</div>
+          <div className="flex items-center justify-between text-[#94A3B8]">
+            <span>Video Encoder</span>
+            <span className={capabilities?.ffmpeg ? 'text-emerald-400 font-mono' : 'text-rose-400 font-mono'}>
+              {capabilities
+                ? capabilities.ffmpeg
+                  ? capabilities.nvenc
+                    ? 'NVENC GPU'
+                    : 'CPU x264'
+                  : 'Missing'
+                : '...'}
+            </span>
+          </div>
+          <div className="flex items-center justify-between text-[#94A3B8]">
+            <span>yt-dlp Links</span>
+            <span className={capabilities?.ytdlp ? 'text-emerald-400 font-mono' : 'text-amber-400 font-mono'}>
+              {capabilities ? (capabilities.ytdlp ? 'Ready' : 'Optional') : '...'}
+            </span>
+          </div>
+          <div className="flex items-center justify-between text-[#94A3B8]">
+            <span>AI Router</span>
+            <span className="text-[#CBD5E1] font-mono">
+              {routerState
+                ? `${routerState.providers.filter((p) => p.configured).length} Active`
+                : '...'}
+            </span>
+          </div>
+          <div className="flex items-center justify-between text-[#94A3B8]">
+            <span>Custom LLM</span>
+            <span className={customLlm?.running ? 'text-emerald-400 font-mono' : 'text-[#94A3B8] font-mono'}>
+              {customLlm ? (customLlm.running ? 'Running' : 'Stopped') : '...'}
+            </span>
+          </div>
+          <div className="flex items-center justify-between text-[#94A3B8]">
+            <span>Burned Captions</span>
+            <span className="text-[#CBD5E1] font-mono">Disabled</span>
+          </div>
+        </div>
+      </aside>
+
+      {/* Main Workspace */}
+      <div className="flex-1 min-w-0 flex flex-col">
+        {/* Top Bar Contract: Breadcrumb on left, 1 primary action on right */}
+        <header className="h-16 px-6 border-b border-[#232834] bg-[#0E1016] flex items-center justify-between gap-8 shrink-0">
+          <div className="flex items-center gap-2 text-sm min-w-0">
+            <span className="text-[#64748B] whitespace-nowrap">Studio</span>
+            <span className="text-[#475569]">/</span>
+            <span className="font-display font-semibold text-[#F4F5F7] whitespace-nowrap">
+              {activeNavMeta.label}
+            </span>
+            {activeProject && activeTab !== 'queue' && (
+              <>
+                <span className="text-[#475569] hidden sm:inline">/</span>
+                <span className="text-[#94A3B8] truncate max-w-[300px] hidden sm:inline">
+                  {activeProject.title}
+                </span>
+              </>
+            )}
+          </div>
+
+          <div className="flex items-center gap-4 shrink-0">
+            {connectedChannel && (
+              <span className="hidden md:inline text-xs text-[#94A3B8] whitespace-nowrap">
+                Channel: {connectedChannel.title}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                if (activeTab === 'ingest' && activeProject && selectedMoment) {
+                  setActiveTab('facecam');
+                } else if (activeTab === 'facecam' && clips.length > 0) {
+                  setActiveTab('queue');
+                } else if (activeTab === 'queue' && clips.length > 0) {
+                  setActiveTab('youtube');
+                } else {
+                  setActiveTab('ingest');
+                }
+              }}
+              className="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-500 text-white rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {activeTab === 'ingest' && activeProject
+                ? 'Configure Facecam'
+                : activeTab === 'facecam' && clips.length > 0
+                  ? 'View Render Queue'
+                  : activeTab === 'queue' && clips.length > 0
+                    ? 'Publish to YouTube'
+                    : 'New Source Video'}
+            </button>
+          </div>
+        </header>
+
+        <main className="flex-1 p-6 max-w-[1400px] w-full mx-auto">
+          {loadingInitial ? (
+            <div className="space-y-4">
+              <div className="h-40 bg-[#13161D] border border-[#232834] rounded-xl animate-pulse" />
+              <div className="h-72 bg-[#13161D] border border-[#232834] rounded-xl animate-pulse" />
+            </div>
+          ) : (
+            <>
+              {activeTab === 'ingest' && (
+                <IngestAnalyzeView
+                  capabilities={capabilities}
+                  projects={projects}
+                  activeProject={activeProject}
+                  selectedMomentId={selectedMoment?.id || null}
+                  weights={weights}
+                  watchlist={watchlist}
+                  routerState={routerState}
+                  customLlm={customLlm}
+                  trainingStats={trainingStats}
+                  onSelectProject={(proj) => {
+                    setActiveProject(proj);
+                    setSelectedMoment(proj.moments[0] || null);
+                  }}
+                  onSelectMoment={(moment) => setSelectedMoment(moment)}
+                  onOpenFacecamStudio={(moment) => {
+                    setSelectedMoment(moment);
+                    setActiveTab('facecam');
+                  }}
+                  onProjectCreated={handleProjectCreated}
+                  onProjectUpdated={handleProjectUpdated}
+                  onProjectDeleted={handleProjectDeleted}
+                  onWeightsUpdated={setWeights}
+                  onWatchlistUpdated={setWatchlist}
+                  onRouterStateUpdated={setRouterState}
+                  onCustomLlmUpdated={setCustomLlm}
+                  onTrainingStatsUpdated={setTrainingStats}
+                />
+              )}
+
+              {activeTab === 'facecam' && (
+                <FacecamLayoutStudio
+                  project={activeProject}
+                  moment={selectedMoment}
+                  onSelectMoment={setSelectedMoment}
+                  onProjectUpdated={handleProjectUpdated}
+                  onClipRendered={handleClipRendered}
+                />
+              )}
+
+              {activeTab === 'queue' && (
+                <RenderQueueView
+                  clips={clips}
+                  onDeleteClip={handleClipDeleted}
+                  onPublishClip={(clip) => {
+                    setSelectedClipId(clip.id);
+                    setActiveTab('youtube');
+                  }}
+                  onGoToStudio={() => setActiveTab('facecam')}
+                />
+              )}
+
+              {activeTab === 'youtube' && (
+                <YouTubePublishView
+                  clips={clips}
+                  selectedClipId={selectedClipId}
+                  onSelectClipId={setSelectedClipId}
+                  onClipUpdated={handleClipUpdated}
+                  onChannelConnected={setConnectedChannel}
+                />
+              )}
+            </>
+          )}
+        </main>
+      </div>
+    </div>
+  );
+}
