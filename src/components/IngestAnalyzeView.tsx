@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Link2,
   Upload,
@@ -17,6 +17,7 @@ import {
   Cpu,
   Power,
   Download,
+  Cookie,
 } from 'lucide-react';
 import type {
   CreatorWatchItem,
@@ -31,6 +32,7 @@ import type {
   ViralMoment,
 } from '../types';
 import { LAYOUT_OPTIONS } from '../types';
+import { formatTimecode, parseTimecodeInput, pollJobUntilDone } from '../lib/jobs';
 
 interface IngestAnalyzeViewProps {
   capabilities: SystemCapabilities | null;
@@ -56,9 +58,7 @@ interface IngestAnalyzeViewProps {
 }
 
 function formatTime(sec: number): string {
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return formatTimecode(sec);
 }
 
 function formatDiskBytes(bytes?: number): string {
@@ -95,37 +95,60 @@ export function IngestAnalyzeView({
   const [showTranscriptBox, setShowTranscriptBox] = useState(false);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [ingestProgress, setIngestProgress] = useState(0);
+  const [ingestStage, setIngestStage] = useState<string>('');
+  const [ingestDetail, setIngestDetail] = useState<string>('');
   const [customLlmBusy, setCustomLlmBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Live clipping markers
+  // Live clipping markers & remote-stream segment preview state
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [markIn, setMarkIn] = useState<number | null>(null);
   const [manualTitle, setManualTitle] = useState('');
+  const [remotePreviewSrc, setRemotePreviewSrc] = useState<string | null>(null);
+  const [remotePreviewOffsetSec, setRemotePreviewOffsetSec] = useState(0);
+  const [jumpInput, setJumpInput] = useState('');
 
-  // Creator watchlist form
-  const [watchCreator, setWatchCreator] = useState('');
-  const [watchUrl, setWatchUrl] = useState('');
-  const [watchPlatform, setWatchPlatform] = useState<'youtube' | 'twitch' | 'kick'>('twitch');
-  const [watchLayout, setWatchLayout] = useState<LayoutId>('split-top-cam');
+  // Optional YouTube cookies.txt state (resolves cloud-IP bot verification cleanly)
+  const [showCookiesBox, setShowCookiesBox] = useState(false);
+  const [cookiesText, setCookiesText] = useState('');
+  const [cookiesStatus, setCookiesStatus] = useState<{
+    configured: boolean;
+    source: string;
+    cookieCount: number;
+  } | null>(null);
+  const [cookiesBusy, setCookiesBusy] = useState(false);
+  const cookiesFileRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    fetch('/api/ytdlp/cookies/status')
+      .then((r) => r.json())
+      .then((data) => setCookiesStatus(data))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    setRemotePreviewSrc(null);
+    setMarkIn(null);
+    if (activeProject?.sourceMode === 'remote-stream' && activeProject.moments[0]) {
+      const startOff = Math.max(0, Math.floor(activeProject.moments[0].startSec - 2));
+      setRemotePreviewOffsetSec(startOff);
+      setCurrentTime(startOff);
+    } else {
+      setRemotePreviewOffsetSec(0);
+      setCurrentTime(0);
+    }
+  }, [activeProject?.id]);
 
   const handleUrlIngest = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!urlInput.trim()) return;
     setErrorMsg(null);
     setBusyAction('url');
-    setIngestProgress(0);
-
-    // Animate progress bar during the request (server does not stream progress yet)
-    let progressAborted = false;
-    (async () => {
-      while (!progressAborted && ingestProgress < 90) {
-        await new Promise((r) => setTimeout(r, 300));
-        setIngestProgress((p) => Math.min(90, p + 5));
-      }
-    })();
+    setIngestProgress(4);
+    setIngestStage('Connecting to stream...');
+    setIngestDetail('');
 
     try {
       const res = await fetch('/api/ingest/url', {
@@ -137,35 +160,80 @@ export function IngestAnalyzeView({
           transcriptText: transcriptInput.trim() || undefined,
         }),
       });
-      progressAborted = true;
-      setIngestProgress(100);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'URL ingest failed');
-      onProjectCreated(data.project);
+
+      let createdProject = data.project;
+      if (data.jobId) {
+        const done = await pollJobUntilDone(data.jobId, (job) => {
+          setIngestProgress(job.progress);
+          setIngestStage(job.stage);
+          setIngestDetail(job.detail || '');
+        });
+        createdProject = done.project;
+      }
+
+      if (!createdProject) throw new Error('Ingest finished without returning a project.');
+      setIngestProgress(100);
+      setRemotePreviewSrc(null);
+      setRemotePreviewOffsetSec(0);
+      onProjectCreated(createdProject);
       setUrlInput('');
       setCustomTitle('');
     } catch (err) {
-      progressAborted = true;
       setIngestProgress(0);
-      setErrorMsg(err instanceof Error ? err.message : 'URL ingest failed');
+      const msg = err instanceof Error ? err.message : 'URL ingest failed';
+      setErrorMsg(msg);
+      if (msg.toLowerCase().includes('bot verification') || msg.toLowerCase().includes('cookies')) {
+        setShowCookiesBox(true);
+      }
     } finally {
       setBusyAction(null);
+      setIngestStage('');
+      setIngestDetail('');
       setTimeout(() => setIngestProgress(0), 400);
+    }
+  };
+
+  const handleSaveCookies = async (rawText?: string) => {
+    const payload = (rawText ?? cookiesText).trim();
+    if (!payload) return;
+    setCookiesBusy(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetch('/api/ytdlp/cookies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cookiesText: payload }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to save cookies');
+      setCookiesStatus(data);
+      setCookiesText('');
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to save cookies');
+    } finally {
+      setCookiesBusy(false);
+    }
+  };
+
+  const handleClearCookies = async () => {
+    setCookiesBusy(true);
+    try {
+      const res = await fetch('/api/ytdlp/cookies', { method: 'DELETE' });
+      const data = await res.json();
+      if (res.ok) setCookiesStatus(data);
+    } finally {
+      setCookiesBusy(false);
     }
   };
 
   const handleFileUpload = async (file: File) => {
     setErrorMsg(null);
     setBusyAction('upload');
-    setIngestProgress(0);
-
-    let progressAborted = false;
-    (async () => {
-      while (!progressAborted && ingestProgress < 85) {
-        await new Promise((r) => setTimeout(r, 300));
-        setIngestProgress((p) => Math.min(85, p + 5));
-      }
-    })();
+    setIngestProgress(5);
+    setIngestStage('Uploading video file...');
+    setIngestDetail(file.name);
 
     try {
       const form = new FormData();
@@ -176,21 +244,41 @@ export function IngestAnalyzeView({
         method: 'POST',
         body: form,
       });
-      progressAborted = true;
-      setIngestProgress(100);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Upload failed');
-      onProjectCreated(data.project);
+
+      let createdProject = data.project;
+      if (data.jobId) {
+        const done = await pollJobUntilDone(data.jobId, (job) => {
+          setIngestProgress(job.progress);
+          setIngestStage(job.stage);
+          setIngestDetail(job.detail || '');
+        });
+        createdProject = done.project;
+      }
+
+      if (!createdProject) throw new Error('Upload finished without returning a project.');
+      setIngestProgress(100);
+      setRemotePreviewSrc(null);
+      setRemotePreviewOffsetSec(0);
+      onProjectCreated(createdProject);
       setCustomTitle('');
     } catch (err) {
-      progressAborted = true;
       setIngestProgress(0);
       setErrorMsg(err instanceof Error ? err.message : 'Upload failed');
     } finally {
       setBusyAction(null);
+      setIngestStage('');
+      setIngestDetail('');
       setTimeout(() => setIngestProgress(0), 400);
     }
   };
+
+  // Creator watchlist form
+  const [watchCreator, setWatchCreator] = useState('');
+  const [watchUrl, setWatchUrl] = useState('');
+  const [watchPlatform, setWatchPlatform] = useState<'youtube' | 'twitch' | 'kick'>('twitch');
+  const [watchLayout, setWatchLayout] = useState<LayoutId>('split-top-cam');
 
   const handleGenerateSample = async () => {
     setErrorMsg(null);
@@ -308,7 +396,18 @@ export function IngestAnalyzeView({
     if (res.ok && data.watchlist) onWatchlistUpdated(data.watchlist);
   };
 
-  const seekVideoTo = (sec: number) => {
+  const seekVideoTo = (sec: number, momentId?: string) => {
+    if (!activeProject) return;
+    if (activeProject.sourceMode === 'remote-stream') {
+      const targetOffset = Math.max(0, Math.floor(sec - (momentId ? 2 : 0)));
+      const src = momentId
+        ? `/api/projects/${activeProject.id}/moments/${momentId}/preview`
+        : `/api/projects/${activeProject.id}/preview-window?start=${targetOffset}&dur=45`;
+      setRemotePreviewOffsetSec(targetOffset);
+      setRemotePreviewSrc(src);
+      setCurrentTime(targetOffset);
+      return;
+    }
     if (videoRef.current) {
       videoRef.current.currentTime = sec;
       videoRef.current.play().catch(() => {});
@@ -368,16 +467,19 @@ export function IngestAnalyzeView({
                 </button>
 
                 {busyAction === 'url' && (
-                  <div className="flex flex-col gap-1">
-                    <div className="w-full h-1.5 bg-[#0E1016] rounded-full overflow-hidden border border-[#232834]">
+                  <div className="w-full sm:w-44 flex flex-col gap-1 justify-center">
+                    <div className="w-full h-1.5 bg-[#13161D] rounded-full overflow-hidden border border-[#232834]">
                       <div
                         className="h-full bg-rose-500 transition-all duration-300"
                         style={{ width: `${ingestProgress}%` }}
                       />
                     </div>
-                    <p className="text-[10px] font-mono text-[#94A3B8] mt-1 whitespace-nowrap">
-                      {ingestProgress}%
+                    <p className="text-[10px] font-mono text-[#94A3B8] truncate">
+                      {ingestProgress}% {ingestStage ? `· ${ingestStage}` : ''}
                     </p>
+                    {ingestDetail && (
+                      <p className="text-[10px] font-mono text-[#64748B] truncate">{ingestDetail}</p>
+                    )}
                   </div>
                 )}
               </div>
@@ -397,14 +499,30 @@ export function IngestAnalyzeView({
                   <FileText className="w-3.5 h-3.5" />
                   {showTranscriptBox ? 'Hide Transcript / SRT' : 'Attach Transcript / SRT'}
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setShowCookiesBox((v) => !v)}
+                  className={`inline-flex items-center gap-1.5 text-xs cursor-pointer whitespace-nowrap ${
+                    cookiesStatus?.configured
+                      ? 'text-emerald-400 hover:text-emerald-300'
+                      : 'text-[#94A3B8] hover:text-[#F4F5F7]'
+                  }`}
+                >
+                  <Cookie className="w-3.5 h-3.5" />
+                  {cookiesStatus?.configured
+                    ? `YouTube Cookies (${cookiesStatus.cookieCount})`
+                    : showCookiesBox
+                      ? 'Hide YouTube Cookies'
+                      : 'YouTube Cookies'}
+                </button>
               </div>
             </div>
 
-            {!capabilities?.ytdlp && (
-              <p className="text-xs text-amber-400/90 mt-1">
-                Notice: yt-dlp is not detected in this host container — direct MP4 URLs and local uploads work immediately; install yt-dlp locally for YouTube/Twitch/Kick link downloads.
-              </p>
-            )}
+            <p className="text-xs text-[#64748B] mt-1">
+              {capabilities?.ytdlp
+                ? 'Stream extractor ready — long VODs (up to 50+ hours) probe and render directly over remote segments without filling disk.'
+                : 'YouTube, Twitch & Kick links auto-bootstrap yt-dlp on first fetch — long VODs stream on-demand without full multi-GB download.'}
+            </p>
           </form>
 
           {/* Local File Upload Dropzone */}
@@ -423,15 +541,15 @@ export function IngestAnalyzeView({
             </p>
 
             {busyAction === 'upload' && (
-              <div className="flex flex-col gap-1 mt-2">
-                <div className="w-full h-1.5 bg-[#0E1016] rounded-full overflow-hidden border border-[#232834]">
+              <div className="w-full max-w-[220px] flex flex-col gap-1 mt-2">
+                <div className="w-full h-1.5 bg-[#13161D] rounded-full overflow-hidden border border-[#232834]">
                   <div
                     className="h-full bg-rose-500 transition-all duration-300"
                     style={{ width: `${ingestProgress}%` }}
                   />
                 </div>
-                <p className="text-[10px] font-mono text-[#94A3B8] mt-1 whitespace-nowrap">
-                  {ingestProgress}%
+                <p className="text-[10px] font-mono text-[#94A3B8] mt-1 truncate">
+                  {ingestProgress}% {ingestStage ? `· ${ingestStage}` : ''}
                 </p>
               </div>
             )}
@@ -484,6 +602,71 @@ export function IngestAnalyzeView({
               placeholder="Paste .srt cues or raw speech transcript for hook keyword + local Ollama scoring..."
               className="w-full p-3 text-xs font-mono bg-[#0E1016] border border-[#232834] rounded-lg text-[#F4F5F7] placeholder:text-[#64748B] outline-none focus:border-rose-500"
             />
+          </div>
+        )}
+
+        {showCookiesBox && (
+          <div className="mt-4 pt-4 border-t border-[#232834] space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <p className="text-xs font-medium text-[#CBD5E1]">
+                  YouTube Bot-Verification Cookies (Netscape cookies.txt or Cookie header)
+                </p>
+                <p className="text-[11px] text-[#94A3B8] mt-0.5">
+                  Cloud container IPs trigger YouTube bot verification. Export cookies.txt from a logged-in browser (e.g. “Get cookies.txt LOCALLY”) and upload or paste once. Stored server-side in workspace/ytdlp_cookies.txt.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  ref={cookiesFileRef}
+                  type="file"
+                  accept=".txt,text/plain"
+                  className="hidden"
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    const txt = await file.text();
+                    await handleSaveCookies(txt);
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={cookiesBusy}
+                  onClick={() => cookiesFileRef.current?.click()}
+                  className="px-3 py-1.5 text-xs font-medium bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-md text-[#F4F5F7] cursor-pointer"
+                >
+                  Upload cookies.txt
+                </button>
+                {cookiesStatus?.configured && cookiesStatus.source === 'workspace' && (
+                  <button
+                    type="button"
+                    disabled={cookiesBusy}
+                    onClick={handleClearCookies}
+                    className="px-3 py-1.5 text-xs font-medium bg-[#1C212C] hover:bg-rose-950/60 border border-[#32394A] hover:border-rose-700 rounded-md text-rose-300 cursor-pointer"
+                  >
+                    Clear Saved
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2">
+              <textarea
+                rows={3}
+                value={cookiesText}
+                onChange={(e) => setCookiesText(e.target.value)}
+                placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;...&#10;(or paste raw Cookie header string)"
+                className="flex-1 p-2.5 text-xs font-mono bg-[#0E1016] border border-[#232834] rounded-lg text-[#F4F5F7] placeholder:text-[#64748B] outline-none focus:border-rose-500"
+              />
+              <button
+                type="button"
+                disabled={cookiesBusy || !cookiesText.trim()}
+                onClick={() => handleSaveCookies()}
+                className="px-4 py-2 text-xs font-semibold bg-rose-600 hover:bg-rose-500 text-white rounded-lg cursor-pointer disabled:opacity-50 self-end sm:self-stretch"
+              >
+                {cookiesBusy ? 'Saving...' : 'Save Cookies'}
+              </button>
+            </div>
           </div>
         )}
 
@@ -568,7 +751,7 @@ export function IngestAnalyzeView({
                 </p>
               </div>
               <div className="flex items-center gap-3 shrink-0">
-                {!activeProject.sourceDeleted && (
+                {!activeProject.sourceDeleted && activeProject.sourceMode !== 'remote-stream' && (
                   <button
                     type="button"
                     onClick={async () => {
@@ -585,6 +768,11 @@ export function IngestAnalyzeView({
                     Prune Source
                   </button>
                 )}
+                {activeProject.sourceMode === 'remote-stream' && (
+                  <span className="px-2 py-0.5 text-[10px] font-mono uppercase bg-[#1C212C] border border-[#32394A] rounded text-emerald-400">
+                    Remote Stream
+                  </span>
+                )}
                 <span className="text-xs font-mono tabular-nums text-[#CBD5E1]">
                   {formatTime(currentTime)} / {formatTime(activeProject.durationSec)}
                 </span>
@@ -598,6 +786,57 @@ export function IngestAnalyzeView({
                 <p className="text-xs text-[#94A3B8] max-w-sm">
                   Your extracted keyframes, audio energy timeline, and already-rendered 9:16 Shorts remain available.
                 </p>
+              </div>
+            ) : activeProject.sourceMode === 'remote-stream' ? (
+              <div className="space-y-2">
+                <div className="aspect-video bg-[#080A0D] rounded-lg overflow-hidden border border-[#232834]">
+                  {remotePreviewSrc || activeProject.moments[0] ? (
+                    <video
+                      ref={videoRef}
+                      key={
+                        remotePreviewSrc ||
+                        `/api/projects/${activeProject.id}/moments/${activeProject.moments[0].id}/preview`
+                      }
+                      src={
+                        remotePreviewSrc ||
+                        `/api/projects/${activeProject.id}/moments/${activeProject.moments[0].id}/preview`
+                      }
+                      controls
+                      onTimeUpdate={(e) =>
+                        setCurrentTime(remotePreviewOffsetSec + e.currentTarget.currentTime)
+                      }
+                      className="w-full h-full object-contain"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-xs text-[#64748B]">
+                      Click any moment or jump to a timestamp to preview
+                    </div>
+                  )}
+                </div>
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const parsed = parseTimecodeInput(jumpInput);
+                    if (parsed !== null) {
+                      seekVideoTo(Math.min(Math.max(0, activeProject.durationSec - 10), parsed));
+                    }
+                  }}
+                  className="flex items-center gap-2 text-xs"
+                >
+                  <input
+                    type="text"
+                    value={jumpInput}
+                    onChange={(e) => setJumpInput(e.target.value)}
+                    placeholder={`Jump to timestamp (e.g. 24:15:00 or 1200)`}
+                    className="flex-1 px-2.5 py-1 bg-[#0E1016] border border-[#232834] rounded-md text-[#F4F5F7] placeholder:text-[#64748B] font-mono outline-none focus:border-rose-500"
+                  />
+                  <button
+                    type="submit"
+                    className="px-3 py-1 bg-[#1C212C] hover:bg-[#252B39] border border-[#32394A] rounded-md text-[#F4F5F7] cursor-pointer whitespace-nowrap"
+                  >
+                    Load 45s Window
+                  </button>
+                </form>
               </div>
             ) : (
               <div className="aspect-video bg-[#080A0D] rounded-lg overflow-hidden border border-[#232834]">
@@ -617,7 +856,11 @@ export function IngestAnalyzeView({
               <div className="flex items-center justify-between text-xs text-[#94A3B8]">
                 <span>Audio RMS Energy Spikes (click bar to seek)</span>
                 <span className="font-mono tabular-nums">
-                  Peak: {Math.max(...activeProject.audioEnergySeries.map((p) => p.db)).toFixed(1)} dB
+                  Peak:{' '}
+                  {activeProject.audioEnergySeries
+                    .reduce((acc, p) => (p.db > acc ? p.db : acc), -60)
+                    .toFixed(1)}{' '}
+                  dB
                 </span>
               </div>
               <div className="h-20 bg-[#0E1016] border border-[#232834] rounded-lg px-2 py-2 flex items-end gap-[2px] overflow-hidden">
@@ -705,7 +948,7 @@ export function IngestAnalyzeView({
                     key={moment.id}
                     onClick={() => {
                       onSelectMoment(moment);
-                      seekVideoTo(moment.startSec);
+                      seekVideoTo(moment.startSec, moment.id);
                     }}
                     className={`py-4 first:pt-1 last:pb-1 px-3 -mx-3 rounded-lg transition-colors cursor-pointer ${
                       isSelected ? 'bg-[#191E29]' : 'hover:bg-[#171B24]/60'
@@ -777,7 +1020,7 @@ export function IngestAnalyzeView({
                         onClick={(e) => {
                           e.stopPropagation();
                           onSelectMoment(moment);
-                          seekVideoTo(moment.startSec);
+                          seekVideoTo(moment.startSec, moment.id);
                         }}
                         className="inline-flex items-center gap-1.5 text-xs text-[#94A3B8] hover:text-[#F4F5F7] cursor-pointer"
                       >

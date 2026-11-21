@@ -199,9 +199,11 @@ def run_builtin_classifier(prompt: str) -> str:
         text_score = clf.score_text(f"{source_title} {snippet}")
         llm_score = round(min(0.98, max(0.2, spike * 0.55 + text_score * 0.45)), 2)
 
-        mm = int(start_sec // 60)
-        ss = int(start_sec % 60)
-        ts_label = f"{mm:02d}:{ss:02d}"
+        total_s = max(0, int(start_sec))
+        hh = total_s // 3600
+        mm = (total_s % 3600) // 60
+        ss = total_s % 60
+        ts_label = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
 
         if snippet:
             short_phrase = re.sub(r"[^a-zA-Z0-9 '!?,.-]", "", snippet).strip()[:52]

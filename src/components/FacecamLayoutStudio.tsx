@@ -17,6 +17,7 @@ import type {
   ViralMoment,
 } from '../types';
 import { LAYOUT_OPTIONS } from '../types';
+import { formatTimecode, pollJobUntilDone } from '../lib/jobs';
 import { LayoutThumbnail } from './LayoutThumbnail';
 
 interface FacecamLayoutStudioProps {
@@ -68,6 +69,8 @@ export function FacecamLayoutStudio({
   const [clipTitle, setClipTitle] = useState(activeMoment?.title || '');
   const [clipHook, setClipHook] = useState(activeMoment?.hookTagline || '');
   const [isRendering, setIsRendering] = useState(false);
+  const [renderStage, setRenderStage] = useState<string>('');
+  const [renderProgress, setRenderProgress] = useState<number>(0);
   const [isSavingCam, setIsSavingCam] = useState(false);
   const [renderError, setRenderError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
@@ -157,6 +160,8 @@ export function FacecamLayoutStudio({
   const handleRenderClip = async () => {
     setIsRendering(true);
     setRenderError(null);
+    setRenderStage('Starting render...');
+    setRenderProgress(5);
     try {
       const res = await fetch('/api/clips/render', {
         method: 'POST',
@@ -176,11 +181,24 @@ export function FacecamLayoutStudio({
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'FFmpeg render failed');
-      onClipRendered(data.clip);
+
+      let renderedClip = data.clip;
+      if (data.jobId) {
+        const done = await pollJobUntilDone(data.jobId, (job) => {
+          setRenderProgress(job.progress);
+          setRenderStage(job.stage);
+        });
+        renderedClip = done.clip;
+      }
+
+      if (!renderedClip) throw new Error('Render finished without output clip.');
+      onClipRendered(renderedClip);
     } catch (err) {
       setRenderError(err instanceof Error ? err.message : 'FFmpeg render failed');
     } finally {
       setIsRendering(false);
+      setRenderStage('');
+      setRenderProgress(0);
     }
   };
 
@@ -213,7 +231,7 @@ export function FacecamLayoutStudio({
           >
             {project.moments.map((m, i) => (
               <option key={m.id} value={m.id}>
-                #{i + 1} · {m.startSec.toFixed(1)}s–{m.endSec.toFixed(1)}s · {m.title}
+                #{i + 1} · {formatTimecode(m.startSec)}–{formatTimecode(m.endSec)} · {m.title}
               </option>
             ))}
           </select>
@@ -648,7 +666,7 @@ export function FacecamLayoutStudio({
             {isRendering ? (
               <>
                 <Sparkles className="w-4 h-4 animate-spin" />
-                Rendering 9:16 MP4 via FFmpeg (No Captions)...
+                {renderStage || 'Rendering 9:16 MP4 via FFmpeg...'} ({renderProgress}%)
               </>
             ) : (
               <>

@@ -105,9 +105,22 @@ export function deleteProject(projectId: string): boolean {
   if (!target) return false;
   const remaining = all.filter((p) => p.id !== projectId);
   writeJson(PROJECTS_FILE, remaining);
+  if (target.fileName && target.sourceMode !== 'remote-stream') {
+    try {
+      const srcPath = resolveSafeChildPath(SOURCES_DIR, target.fileName);
+      if (fs.existsSync(srcPath)) fs.unlinkSync(srcPath);
+    } catch {
+      // ignore cleanup errors
+    }
+  }
   try {
-    const srcPath = resolveSafeChildPath(SOURCES_DIR, target.fileName);
-    if (fs.existsSync(srcPath)) fs.unlinkSync(srcPath);
+    if (fs.existsSync(FRAMES_DIR)) {
+      for (const file of fs.readdirSync(FRAMES_DIR)) {
+        if (file.startsWith(`${projectId}_`) || file.startsWith(`preview_${projectId}_`)) {
+          fs.unlinkSync(path.join(FRAMES_DIR, file));
+        }
+      }
+    }
   } catch {
     // ignore cleanup errors
   }

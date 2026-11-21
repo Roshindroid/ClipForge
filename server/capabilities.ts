@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { SystemCapabilities } from '../src/types.ts';
 import { ensureWorkspace } from './storage.ts';
+import { findExistingYtDlpBinary } from './ytdlp.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -78,11 +79,11 @@ export async function checkOllama(): Promise<{
 
 export async function getSystemCapabilities(): Promise<SystemCapabilities> {
   ensureWorkspace();
-  const [ffmpeg, ffprobe, nvenc, ytdlp, ollama] = await Promise.all([
+  const [ffmpeg, ffprobe, nvenc, ytdlpBin, ollama] = await Promise.all([
     checkBinary('ffmpeg', ['-version']),
     checkBinary('ffprobe', ['-version']),
     detectNvencSupport(),
-    checkBinary('yt-dlp', ['--version']),
+    findExistingYtDlpBinary(),
     checkOllama(),
   ]);
 
@@ -90,7 +91,7 @@ export async function getSystemCapabilities(): Promise<SystemCapabilities> {
     ffmpeg,
     ffprobe,
     nvenc,
-    ytdlp,
+    ytdlp: Boolean(ytdlpBin),
     ollama,
     workspaceReady: true,
   };

@@ -1,11 +1,26 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import type { PlatformType } from '../src/types.ts';
-import { getSystemCapabilities } from './capabilities.ts';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { promisify } from 'node:util';
+import type { HeatmapPoint, PlatformType, VideoChapter } from '../src/types.ts';
 import { SOURCES_DIR, ensureWorkspace, resolveSafeChildPath } from './storage.ts';
+import {
+  ensureYtDlp,
+  fetchMetadataWithYtDlp,
+  getYtDlpBaseArgs,
+  resolveStreamUrlsWithYtDlp,
+  runProcessWithTimeout,
+  type ResolvedStreamUrls,
+} from './ytdlp.ts';
+
+const execFileAsync = promisify(execFile);
+
+const LOCAL_DOWNLOAD_MAX_DURATION_SEC = 420; // <= 7 min downloads locally; > 7 min (up to 50+ hours) streams on-demand
+const LOCAL_DOWNLOAD_MAX_BYTES = 450 * 1024 * 1024; // 450 MB cap for eager local download
 
 const ALLOWED_STREAM_HOSTS = [
   'youtube.com',
@@ -54,6 +69,7 @@ function isPrivateOrLoopbackHost(hostname: string): boolean {
 export function detectPlatformFromUrl(rawUrl: string): {
   parsedUrl: URL;
   platform: PlatformType;
+  isDirectMediaExt: boolean;
 } {
   let parsedUrl: URL;
   try {
@@ -72,27 +88,27 @@ export function detectPlatformFromUrl(rawUrl: string): {
 
   const host = parsedUrl.hostname.toLowerCase();
   if (host.includes('youtube.com') || host === 'youtu.be') {
-    return { parsedUrl, platform: 'youtube' };
+    return { parsedUrl, platform: 'youtube', isDirectMediaExt: false };
   }
   if (host.includes('twitch.tv')) {
-    return { parsedUrl, platform: 'twitch' };
+    return { parsedUrl, platform: 'twitch', isDirectMediaExt: false };
   }
   if (host.includes('kick.com')) {
-    return { parsedUrl, platform: 'kick' };
+    return { parsedUrl, platform: 'kick', isDirectMediaExt: false };
   }
 
-  if (/\.(mp4|mov|webm|mkv)(\?.*)?$/i.test(parsedUrl.pathname)) {
-    return { parsedUrl, platform: 'direct' };
+  const isDirectMediaExt = /\.(mp4|mov|webm|mkv|m3u8|mpd)(\?.*)?$/i.test(parsedUrl.pathname);
+  if (isDirectMediaExt) {
+    return { parsedUrl, platform: 'direct', isDirectMediaExt: true };
   }
 
   const isKnown = ALLOWED_STREAM_HOSTS.some((h) => host === h || host.endsWith('.' + h));
-  if (!isKnown) {
-    throw new Error(
-      'Unsupported URL host. Use YouTube, Twitch, Kick, or a direct .mp4/.webm/.mov media URL.'
-    );
+  if (isKnown) {
+    return { parsedUrl, platform: 'direct', isDirectMediaExt: false };
   }
 
-  return { parsedUrl, platform: 'direct' };
+  // Allow probing any public HTTPS video/CDN link (validated via HEAD/ffprobe in ingestFromUrl)
+  return { parsedUrl, platform: 'direct', isDirectMediaExt: false };
 }
 
 function runCommand(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
@@ -117,85 +133,299 @@ function runCommand(cmd: string, args: string[]): Promise<{ stdout: string; stde
   });
 }
 
+async function probeRemoteMediaUrl(url: string): Promise<{
+  durationSec: number;
+  width: number;
+  height: number;
+  fps: number;
+  hasAudio: boolean;
+}> {
+  const { stdout } = await execFileAsync(
+    'ffprobe',
+    ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', url],
+    { timeout: 25000 }
+  );
+  const info = JSON.parse(stdout) as {
+    format?: { duration?: string };
+    streams?: Array<{
+      codec_type?: string;
+      width?: number;
+      height?: number;
+      r_frame_rate?: string;
+    }>;
+  };
+  const videoStream = info.streams?.find((s) => s.codec_type === 'video');
+  const audioStream = info.streams?.find((s) => s.codec_type === 'audio');
+  if (!videoStream) {
+    throw new Error('URL does not contain a readable video stream.');
+  }
+  let fps = 30;
+  if (videoStream.r_frame_rate && videoStream.r_frame_rate.includes('/')) {
+    const [num, den] = videoStream.r_frame_rate.split('/').map(Number);
+    if (den > 0 && num > 0) fps = Math.round((num / den) * 100) / 100;
+  }
+  return {
+    durationSec: Math.max(1, Number(info.format?.duration || 15)),
+    width: videoStream.width || 1280,
+    height: videoStream.height || 720,
+    fps,
+    hasAudio: Boolean(audioStream),
+  };
+}
+
+async function streamDirectMediaToFile(url: string, targetPath: string): Promise<void> {
+  const controller = new AbortController();
+  let stallTimer = setTimeout(() => controller.abort(), 45000);
+  const resetStall = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => controller.abort(), 45000);
+  };
+
+  try {
+    const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+    if (!res.ok || !res.body) {
+      throw new Error(`Failed to fetch direct media URL (HTTP ${res.status})`);
+    }
+    const contentLength = Number(res.headers.get('content-length') || 0);
+    if (contentLength > LOCAL_DOWNLOAD_MAX_BYTES) {
+      throw new Error('Remote video exceeds local eager-download cap; switching to remote-stream mode.');
+    }
+
+    const bodyStream = Readable.fromWeb(res.body as unknown as import('node:stream/web').ReadableStream);
+    bodyStream.on('data', resetStall);
+    await pipeline(bodyStream, fs.createWriteStream(targetPath));
+  } finally {
+    clearTimeout(stallTimer);
+  }
+}
+
+export interface IngestResult {
+  fileName: string;
+  title: string;
+  platform: PlatformType;
+  sourceMode: 'local' | 'remote-stream';
+  streamUrls?: ResolvedStreamUrls;
+  preProbed?: {
+    durationSec: number;
+    width: number;
+    height: number;
+    fps: number;
+    hasAudio: boolean;
+  };
+  chapters?: VideoChapter[];
+  heatmap?: HeatmapPoint[];
+}
+
 export async function ingestFromUrl(
   rawUrl: string,
-  titleOverride?: string
-): Promise<{ fileName: string; title: string; platform: PlatformType }> {
+  titleOverride?: string,
+  onProgress?: (pct: number, stage: string, detail?: string) => void
+): Promise<IngestResult> {
   ensureWorkspace();
-  const { parsedUrl, platform } = detectPlatformFromUrl(rawUrl);
+  const { parsedUrl, platform, isDirectMediaExt } = detectPlatformFromUrl(rawUrl);
   const id = crypto.randomBytes(6).toString('hex');
   const fileName = `src_${id}.mp4`;
   const targetPath = resolveSafeChildPath(SOURCES_DIR, fileName);
 
   if (platform === 'direct') {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30000);
-    const res = await fetch(parsedUrl.toString(), { signal: controller.signal });
-    clearTimeout(timer);
-    if (!res.ok) {
-      throw new Error(`Failed to fetch direct media URL (HTTP ${res.status})`);
+    onProgress?.(6, 'Probing remote video URL...', parsedUrl.hostname);
+
+    let contentLength = 0;
+    let contentType = '';
+    try {
+      const headCtrl = new AbortController();
+      const headTimer = setTimeout(() => headCtrl.abort(), 10000);
+      const headRes = await fetch(parsedUrl.toString(), {
+        method: 'HEAD',
+        signal: headCtrl.signal,
+        redirect: 'follow',
+      });
+      clearTimeout(headTimer);
+      contentLength = Number(headRes.headers.get('content-length') || 0);
+      contentType = (headRes.headers.get('content-type') || '').toLowerCase();
+    } catch {
+      // Some CDNs block HEAD requests; fall through to ffprobe
     }
-    const contentLength = Number(res.headers.get('content-length') || 0);
-    if (contentLength > 100 * 1024 * 1024 * 1024) {
-      throw new Error('Remote video exceeds the 100 GB local ingest limit.');
+
+    const isHlsOrDash = /\.(m3u8|mpd)(\?.*)?$/i.test(parsedUrl.pathname) || contentType.includes('mpegurl');
+    if (
+      !isDirectMediaExt &&
+      contentType &&
+      !contentType.startsWith('video/') &&
+      !contentType.includes('octet-stream') &&
+      !contentType.includes('mpegurl') &&
+      !contentType.includes('mp4')
+    ) {
+      // Try yt-dlp as fallback if user pasted a generic video page URL
+      try {
+        onProgress?.(10, 'Checking extractor compatibility...', parsedUrl.hostname);
+        const meta = await fetchMetadataWithYtDlp(parsedUrl.toString(), 'direct');
+        const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
+        return {
+          fileName: `remote_${id}.mp4`,
+          title: titleOverride?.trim() || meta.title,
+          platform: 'direct',
+          sourceMode: 'remote-stream',
+          streamUrls,
+          preProbed: {
+            durationSec: meta.durationSec,
+            width: meta.width,
+            height: meta.height,
+            fps: meta.fps,
+            hasAudio: meta.hasAudio,
+          },
+          chapters: meta.chapters,
+          heatmap: meta.heatmap,
+        };
+      } catch {
+        throw new Error(
+          'Unsupported URL host or non-video link. Use YouTube, Twitch, Kick, or a direct .mp4/.webm/.mov/.m3u8 media URL.'
+        );
+      }
     }
-    const buf = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(targetPath, buf);
+
+    let probed;
+    try {
+      probed = await probeRemoteMediaUrl(parsedUrl.toString());
+    } catch (err) {
+      throw new Error(
+        err instanceof Error
+          ? `Could not read remote media stream: ${err.message}`
+          : 'Could not read remote media stream.'
+      );
+    }
+
     const derivedTitle =
       titleOverride?.trim() ||
       path.basename(parsedUrl.pathname, path.extname(parsedUrl.pathname)) ||
       `Direct Stream ${id}`;
-    return { fileName, title: derivedTitle, platform };
+
+    // Long direct videos (including 50-hour MP4/HLS streams) stay in remote-stream mode — zero multi-GB download!
+    if (
+      isHlsOrDash ||
+      probed.durationSec > LOCAL_DOWNLOAD_MAX_DURATION_SEC ||
+      contentLength > LOCAL_DOWNLOAD_MAX_BYTES
+    ) {
+      onProgress?.(
+        18,
+        'Remote stream indexed (zero full-VOD download)',
+        `${Math.round(probed.durationSec / 60)} min · ${probed.width}x${probed.height}`
+      );
+      return {
+        fileName: `remote_${id}.mp4`,
+        title: derivedTitle.slice(0, 120),
+        platform: 'direct',
+        sourceMode: 'remote-stream',
+        streamUrls: {
+          videoUrl: parsedUrl.toString(),
+          audioUrl: parsedUrl.toString(),
+          isSeparate: false,
+          resolvedAt: Date.now(),
+        },
+        preProbed: probed,
+      };
+    }
+
+    onProgress?.(12, 'Downloading short media file...', derivedTitle);
+    await streamDirectMediaToFile(parsedUrl.toString(), targetPath);
+    return {
+      fileName,
+      title: derivedTitle.slice(0, 120),
+      platform,
+      sourceMode: 'local',
+      preProbed: probed,
+    };
   }
 
-  // Platform link (YouTube / Twitch / Kick): requires yt-dlp locally
-  const caps = await getSystemCapabilities();
-  if (!caps.ytdlp) {
-    throw new Error(
-      `yt-dlp is not installed in this runtime to download ${platform.toUpperCase()} URLs. Install yt-dlp locally (pip install yt-dlp) or upload an MP4 file directly.`
+  // Platform link (YouTube / Twitch / Kick): auto-bootstrap yt-dlp if missing
+  onProgress?.(6, 'Preparing stream extractor (yt-dlp)...', platform.toUpperCase());
+  const bin = await ensureYtDlp();
+
+  onProgress?.(12, `Fetching ${platform.toUpperCase()} metadata & heatmaps...`);
+  const meta = await fetchMetadataWithYtDlp(parsedUrl.toString(), platform);
+  const resolvedTitle = titleOverride?.trim() || meta.title;
+
+  // For videos > 7 min (including 10-hour or 50-hour VODs), stream directly on demand!
+  if (meta.durationSec > LOCAL_DOWNLOAD_MAX_DURATION_SEC || meta.isLive) {
+    onProgress?.(
+      20,
+      'Long-form stream ready for remote scanning',
+      `${(meta.durationSec / 3600).toFixed(1)}h · ${meta.width}x${meta.height}`
     );
+    const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
+    return {
+      fileName: `remote_${id}.mp4`,
+      title: resolvedTitle.slice(0, 120),
+      platform,
+      sourceMode: 'remote-stream',
+      streamUrls,
+      preProbed: {
+        durationSec: meta.durationSec,
+        width: meta.width,
+        height: meta.height,
+        fps: meta.fps,
+        hasAudio: meta.hasAudio,
+      },
+      chapters: meta.chapters,
+      heatmap: meta.heatmap,
+    };
   }
 
-  const ytDlpCookiesFromBrowser = process.env.YTDLP_COOKIES_FROM_BROWSER?.trim();
-  const ytDlpCookiesFile = process.env.YTDLP_COOKIES_FILE?.trim();
-  const ytDlpBaseArgs: string[] = ['--no-playlist'];
-  if (ytDlpCookiesFile) {
-    ytDlpBaseArgs.push('--cookies', ytDlpCookiesFile);
-  } else if (ytDlpCookiesFromBrowser) {
-    ytDlpBaseArgs.push('--cookies-from-browser', ytDlpCookiesFromBrowser);
-  }
-
-  let fetchedTitle = titleOverride?.trim() || `${platform.toUpperCase()} Stream ${id}`;
+  // Short platform clip (<= 7 min): download locally for instant scrubbing, fallback to remote-stream if download fails
+  onProgress?.(16, `Downloading ${platform.toUpperCase()} clip locally...`, resolvedTitle);
   try {
-    const meta = await runCommand('yt-dlp', [
-      ...ytDlpBaseArgs,
-      '--print',
-      '%(title)s',
-      parsedUrl.toString(),
-    ]);
-    if (meta.stdout.trim() && !titleOverride?.trim()) {
-      fetchedTitle = meta.stdout.trim().slice(0, 120);
+    const baseArgs = getYtDlpBaseArgs();
+    await runProcessWithTimeout(
+      bin,
+      [
+        ...baseArgs,
+        '-f',
+        'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b',
+        '--merge-output-format',
+        'mp4',
+        '-o',
+        targetPath,
+        parsedUrl.toString(),
+      ],
+      180000
+    );
+
+    if (fs.existsSync(targetPath)) {
+      return {
+        fileName,
+        title: resolvedTitle.slice(0, 120),
+        platform,
+        sourceMode: 'local',
+      };
     }
   } catch {
-    // Keep fallback title if metadata print fails
+    if (fs.existsSync(targetPath)) {
+      try {
+        fs.unlinkSync(targetPath);
+      } catch {
+        // ignore
+      }
+    }
   }
 
-  await runCommand('yt-dlp', [
-    ...ytDlpBaseArgs,
-    '-f',
-    'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
-    '--merge-output-format',
-    'mp4',
-    '-o',
-    targetPath,
-    parsedUrl.toString(),
-  ]);
-
-  if (!fs.existsSync(targetPath)) {
-    throw new Error('yt-dlp finished without writing an MP4 output file.');
-  }
-
-  return { fileName, title: fetchedTitle, platform };
+  // Fallback to remote-stream mode if eager local download failed
+  const streamUrls = meta.streamUrls || (await resolveStreamUrlsWithYtDlp(parsedUrl.toString()));
+  return {
+    fileName: `remote_${id}.mp4`,
+    title: resolvedTitle.slice(0, 120),
+    platform,
+    sourceMode: 'remote-stream',
+    streamUrls,
+    preProbed: {
+      durationSec: meta.durationSec,
+      width: meta.width,
+      height: meta.height,
+      fps: meta.fps,
+      hasAudio: meta.hasAudio,
+    },
+    chapters: meta.chapters,
+    heatmap: meta.heatmap,
+  };
 }
 
 /**

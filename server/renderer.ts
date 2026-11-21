@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import type {
   BrandingConfig,
   FacecamBox,
@@ -11,7 +12,14 @@ import type {
   ViralMoment,
 } from '../src/types.ts';
 import { detectNvencSupport } from './capabilities.ts';
-import { RENDERS_DIR, SOURCES_DIR, ensureWorkspace, resolveSafeChildPath } from './storage.ts';
+import {
+  FRAMES_DIR,
+  RENDERS_DIR,
+  SOURCES_DIR,
+  ensureWorkspace,
+  resolveSafeChildPath,
+} from './storage.ts';
+import { downloadSegmentWithYtDlp, resolveStreamUrlsWithYtDlp } from './ytdlp.ts';
 
 const OUT_WIDTH = 720;
 const OUT_HEIGHT = 1280;
@@ -32,9 +40,6 @@ function findDrawtextFont(): string {
   return '';
 }
 
-/**
- * Strictly escapes strings passed to FFmpeg drawtext so filtergraph syntax is never broken.
- */
 function sanitizeDrawtext(input: string, maxLen = 48): string {
   return input
     .replace(/[\r\n]+/g, ' ')
@@ -56,7 +61,6 @@ function buildLayoutFilterGraph(
   cam: FacecamBox,
   bgHex: string
 ): { filterSteps: string[]; finalVideoLabel: string } {
-  // Clamp normalized facecam coordinates safely inside source dimensions
   const camX = even(Math.max(0, Math.min(0.85, cam.x)) * srcWidth);
   const camY = even(Math.max(0, Math.min(0.85, cam.y)) * srcHeight);
   const camW = even(Math.max(0.08, Math.min(1 - camX / srcWidth, cam.width)) * srcWidth);
@@ -123,20 +127,25 @@ function buildLayoutFilterGraph(
     return { filterSteps: steps, finalVideoLabel: 'vbase' };
   }
 
-  // blurred-bg-cam-top or blurred-bg-cam-bottom
-  const mainFitH = even((OUT_WIDTH * srcHeight) / Math.max(1, srcWidth));
+  // blurred-bg-cam-top or blurred-bg-cam-bottom (clamped safely for any source aspect ratio)
+  const rawFitH = even((OUT_WIDTH * srcHeight) / Math.max(1, srcWidth));
+  const mainFitH = Math.min(OUT_HEIGHT - 40, rawFitH);
+  const mainFitW =
+    rawFitH > mainFitH ? even((mainFitH * srcWidth) / Math.max(1, srcHeight)) : OUT_WIDTH;
+  const mainX = even((OUT_WIDTH - mainFitW) / 2);
+  const mainY = even((OUT_HEIGHT - mainFitH) / 2);
+
   const camWOut = 280;
   const camHOut = 230;
-  const mainY = even((OUT_HEIGHT - mainFitH) / 2);
   const camYOut = layoutId === 'blurred-bg-cam-top' ? 110 : OUT_HEIGHT - camHOut - 130;
   const camXOut = even((OUT_WIDTH - camWOut) / 2);
 
   steps.push(
     `[0:v]split=3[src_bg][src_main][src_cam]`,
     `[src_bg]scale=${OUT_WIDTH}:${OUT_HEIGHT}:force_original_aspect_ratio=increase,crop=${OUT_WIDTH}:${OUT_HEIGHT},boxblur=24:4,drawbox=x=0:y=0:w=${OUT_WIDTH}:h=${OUT_HEIGHT}:color=${bgColor}@0.35:t=fill,setsar=1[bg_blur]`,
-    `[src_main]scale=${OUT_WIDTH}:${mainFitH},setsar=1[main_fit]`,
+    `[src_main]scale=${mainFitW}:${mainFitH},setsar=1[main_fit]`,
     `[src_cam]crop=${camW}:${camH}:${camX}:${camY},scale=${camWOut}:${camHOut}:force_original_aspect_ratio=increase,crop=${camWOut}:${camHOut},drawbox=x=0:y=0:w=${camWOut}:h=${camHOut}:color=white@0.75:t=3,setsar=1[cam_card]`,
-    `[bg_blur][main_fit]overlay=0:${mainY}[tmp_bg_main]`,
+    `[bg_blur][main_fit]overlay=${mainX}:${mainY}[tmp_bg_main]`,
     `[tmp_bg_main][cam_card]overlay=${camXOut}:${camYOut}[vbase]`
   );
   return { filterSteps: steps, finalVideoLabel: 'vbase' };
@@ -153,8 +162,6 @@ function buildTemplateAndBrandingFilters(
   const steps: string[] = [];
   let current = inLabel;
 
-  // Note: Only optional layout header templates (X post / TikTok hook / Breaking News) and credit watermark.
-  // NEVER burned captions or word-by-word subtitles!
   if (templateId === 'x-post' && fontFile) {
     const headline = sanitizeDrawtext(hookTagline || 'Clip highlight', 44);
     const handle = sanitizeDrawtext(branding.creditText || '@creator', 26);
@@ -187,6 +194,195 @@ function buildTemplateAndBrandingFilters(
   return { filterSteps: steps, finalVideoLabel: current };
 }
 
+function runFfmpegWithTimeout(args: string[], timeoutMs = 240000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('ffmpeg', args, { shell: false });
+    let stderr = '';
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        child.kill('SIGTERM');
+        setTimeout(() => child.kill('SIGKILL'), 2000);
+        reject(new Error(`FFmpeg timed out after ${Math.round(timeoutMs / 1000)}s`));
+      }
+    }, timeoutMs);
+
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length < 256 * 1024) {
+        stderr += String(chunk);
+      }
+    });
+    child.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`FFmpeg render failed (code ${code}): ${stderr.slice(-400)}`));
+      }
+    });
+  });
+}
+
+async function resolveProjectSourceInputs(project: VideoProject): Promise<{
+  videoUrl: string;
+  audioUrl: string;
+  isSeparate: boolean;
+  isRemote: boolean;
+}> {
+  if (project.sourceMode !== 'remote-stream') {
+    const srcPath = resolveSafeChildPath(SOURCES_DIR, project.fileName);
+    if (fs.existsSync(srcPath)) {
+      return { videoUrl: srcPath, audioUrl: srcPath, isSeparate: false, isRemote: false };
+    }
+  }
+
+  if (!project.sourceUrl) {
+    throw new Error('Source video file is missing from workspace.');
+  }
+
+  if (project.sourceType === 'direct') {
+    return {
+      videoUrl: project.sourceUrl,
+      audioUrl: project.sourceUrl,
+      isSeparate: false,
+      isRemote: true,
+    };
+  }
+
+  const resolved = await resolveStreamUrlsWithYtDlp(project.sourceUrl);
+  return {
+    videoUrl: resolved.videoUrl,
+    audioUrl: resolved.audioUrl,
+    isSeparate: resolved.isSeparate,
+    isRemote: true,
+  };
+}
+
+/**
+ * Extracts and caches a lightweight 45s preview MP4 slice for remote-stream projects
+ * so users can scrub and mark clips at any timestamp inside a 50-hour VOD.
+ */
+export async function ensureRemotePreviewSegment(
+  project: VideoProject,
+  startSec: number,
+  durationSec = 45
+): Promise<string> {
+  ensureWorkspace();
+  const safeStart = Math.max(0, Math.min(Math.max(0, project.durationSec - 4), Math.floor(startSec)));
+  const safeDur = Math.max(4, Math.min(60, Math.round(durationSec)));
+  const cacheName = `preview_${project.id}_${safeStart}_${safeDur}.mp4`;
+  const outPath = resolveSafeChildPath(FRAMES_DIR, cacheName);
+
+  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 1024) {
+    return outPath;
+  }
+
+  const src = await resolveProjectSourceInputs(project);
+  const tmpPath = `${outPath}.${crypto.randomBytes(3).toString('hex')}.tmp.mp4`;
+
+  const buildPreviewArgs = (videoIn: string, audioIn: string, isSep: boolean, isRem: boolean) => {
+    const args: string[] = ['-y'];
+    const rec = isRem ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '4'] : [];
+    args.push(...rec, '-ss', safeStart.toFixed(2), '-t', safeDur.toFixed(2), '-i', videoIn);
+    if (isSep) {
+      args.push(...rec, '-ss', safeStart.toFixed(2), '-t', safeDur.toFixed(2), '-i', audioIn);
+    }
+    args.push('-map', '0:v:0');
+    if (project.hasAudio) {
+      args.push('-map', isSep ? '1:a:0?' : '0:a:0?', '-c:a', 'aac', '-b:a', '96k');
+    } else {
+      args.push('-an');
+    }
+    args.push(
+      '-vf',
+      'scale=854:-2',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-crf',
+      '26',
+      '-pix_fmt',
+      'yuv420p',
+      '-movflags',
+      '+faststart',
+      tmpPath
+    );
+    return args;
+  };
+
+  try {
+    await runFfmpegWithTimeout(
+      buildPreviewArgs(src.videoUrl, src.audioUrl, src.isSeparate, src.isRemote),
+      90000
+    );
+  } catch (err) {
+    if (src.isRemote && project.sourceUrl && project.sourceType !== 'direct') {
+      // Refresh expired URL or fallback to yt-dlp section download
+      const segTmp = path.join(FRAMES_DIR, `seg_${crypto.randomBytes(4).toString('hex')}.mp4`);
+      try {
+        await downloadSegmentWithYtDlp(
+          project.sourceUrl,
+          safeStart,
+          safeStart + safeDur,
+          segTmp
+        );
+        await runFfmpegWithTimeout(
+          [
+            '-y',
+            '-i',
+            segTmp,
+            '-vf',
+            'scale=854:-2',
+            '-c:v',
+            'libx264',
+            '-preset',
+            'ultrafast',
+            '-crf',
+            '26',
+            '-pix_fmt',
+            'yuv420p',
+            '-c:a',
+            'aac',
+            '-b:a',
+            '96k',
+            '-movflags',
+            '+faststart',
+            tmpPath,
+          ],
+          90000
+        );
+      } finally {
+        if (fs.existsSync(segTmp)) {
+          try {
+            fs.unlinkSync(segTmp);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    } else {
+      throw err;
+    }
+  }
+
+  if (fs.existsSync(tmpPath)) {
+    fs.renameSync(tmpPath, outPath);
+  }
+  return outPath;
+}
+
 export async function renderVerticalClip(params: {
   project: VideoProject;
   moment: ViralMoment;
@@ -198,12 +394,11 @@ export async function renderVerticalClip(params: {
   hookTaglineOverride?: string;
   descriptionOverride?: string;
   hashtagsOverride?: string[];
+  onProgress?: (pct: number, stage: string, detail?: string) => void;
 }): Promise<RenderedClip> {
   ensureWorkspace();
-  const srcPath = resolveSafeChildPath(SOURCES_DIR, params.project.fileName);
-  if (!fs.existsSync(srcPath)) {
-    throw new Error('Source video file is missing from workspace.');
-  }
+  params.onProgress?.(10, 'Resolving source stream...');
+  const src = await resolveProjectSourceInputs(params.project);
 
   const clipId = `clip_${crypto.randomBytes(5).toString('hex')}`;
   const outputFileName = `${clipId}.mp4`;
@@ -229,77 +424,110 @@ export async function renderVerticalClip(params: {
 
   const allFilters = [...layoutGraph.filterSteps, ...overlayGraph.filterSteps];
   const finalVideoLabel = overlayGraph.finalVideoLabel;
-
-  const args: string[] = [
-    '-y',
-    '-ss',
-    params.moment.startSec.toFixed(2),
-    '-t',
-    clipDuration.toFixed(2),
-    '-i',
-    srcPath,
-    '-filter_complex',
-    allFilters.join(';'),
-    '-map',
-    `[${finalVideoLabel}]`,
-  ];
-
-  if (params.project.hasAudio) {
-    args.push('-map', '0:a:0', '-c:a', 'aac', '-b:a', '128k');
-  } else {
-    args.push('-an');
-  }
-
   const useNvenc = await detectNvencSupport();
   const encoderUsed: 'h264_nvenc' | 'libx264' = useNvenc ? 'h264_nvenc' : 'libx264';
 
-  if (useNvenc) {
-    args.push(
-      '-c:v',
-      'h264_nvenc',
-      '-preset',
-      'p4',
-      '-rc',
-      'vbr',
-      '-cq',
-      '23',
-      '-pix_fmt',
-      'yuv420p',
-      '-movflags',
-      '+faststart',
-      outPath
+  const buildRenderArgs = (
+    videoIn: string,
+    audioIn: string,
+    isSep: boolean,
+    isRem: boolean,
+    useRelativeStart: boolean
+  ): string[] => {
+    const args: string[] = ['-y'];
+    const rec = isRem
+      ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
+      : [];
+
+    if (useRelativeStart) {
+      args.push('-i', videoIn, '-t', clipDuration.toFixed(2));
+    } else {
+      args.push(...rec, '-ss', params.moment.startSec.toFixed(2), '-t', clipDuration.toFixed(2), '-i', videoIn);
+      if (isSep) {
+        args.push(...rec, '-ss', params.moment.startSec.toFixed(2), '-t', clipDuration.toFixed(2), '-i', audioIn);
+      }
+    }
+
+    args.push('-filter_complex', allFilters.join(';'), '-map', `[${finalVideoLabel}]`);
+
+    if (params.project.hasAudio) {
+      args.push('-map', isSep && !useRelativeStart ? '1:a:0?' : '0:a:0?', '-c:a', 'aac', '-b:a', '128k');
+    } else {
+      args.push('-an');
+    }
+
+    if (useNvenc) {
+      args.push(
+        '-c:v',
+        'h264_nvenc',
+        '-preset',
+        'p4',
+        '-rc',
+        'vbr',
+        '-cq',
+        '23',
+        '-pix_fmt',
+        'yuv420p',
+        '-movflags',
+        '+faststart',
+        outPath
+      );
+    } else {
+      args.push(
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-crf',
+        '22',
+        '-pix_fmt',
+        'yuv420p',
+        '-movflags',
+        '+faststart',
+        outPath
+      );
+    }
+    return args;
+  };
+
+  params.onProgress?.(35, 'Rendering 9:16 vertical Short with FFmpeg...');
+
+  try {
+    await runFfmpegWithTimeout(
+      buildRenderArgs(src.videoUrl, src.audioUrl, src.isSeparate, src.isRemote, false),
+      240000
     );
-  } else {
-    args.push(
-      '-c:v',
-      'libx264',
-      '-preset',
-      'veryfast',
-      '-crf',
-      '22',
-      '-pix_fmt',
-      'yuv420p',
-      '-movflags',
-      '+faststart',
-      outPath
-    );
+  } catch (err) {
+    if (src.isRemote && params.project.sourceUrl && params.project.sourceType !== 'direct') {
+      // Fallback: download just the clipped segment via yt-dlp --download-sections, then render locally
+      params.onProgress?.(50, 'Extracting remote clip section via yt-dlp...');
+      const segTmp = path.join(RENDERS_DIR, `seg_${clipId}.mp4`);
+      try {
+        await downloadSegmentWithYtDlp(
+          params.project.sourceUrl,
+          params.moment.startSec,
+          params.moment.endSec,
+          segTmp
+        );
+        params.onProgress?.(75, 'Compositing 9:16 layout...');
+        await runFfmpegWithTimeout(buildRenderArgs(segTmp, segTmp, false, false, true), 180000);
+      } finally {
+        if (fs.existsSync(segTmp)) {
+          try {
+            fs.unlinkSync(segTmp);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    } else {
+      throw err;
+    }
   }
 
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn('ffmpeg', args, { shell: false });
-    let stderr = '';
-    child.stderr.on('data', (chunk) => {
-      stderr += String(chunk);
-    });
-    child.on('error', (err) => reject(err));
-    child.on('close', (code) => {
-      if (code === 0 && fs.existsSync(outPath)) {
-        resolve();
-      } else {
-        reject(new Error(`FFmpeg render failed (code ${code}): ${stderr.slice(-400)}`));
-      }
-    });
-  });
+  if (!fs.existsSync(outPath)) {
+    throw new Error('FFmpeg finished without writing output MP4.');
+  }
 
   const stat = fs.statSync(outPath);
 

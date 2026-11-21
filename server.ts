@@ -21,12 +21,13 @@ import {
   stopLocalCustomLlm,
 } from './server/customLlmManager.ts';
 import { generateSampleStreamVideo, ingestFromUrl } from './server/ingest.ts';
+import { completeJob, createJob, failJob, getJob, updateJob } from './server/jobs.ts';
 import {
   clearRouterCooldowns,
   getLLMRouterState,
   setRoutingPriority,
 } from './server/llmRouter.ts';
-import { renderVerticalClip } from './server/renderer.ts';
+import { ensureRemotePreviewSegment, renderVerticalClip } from './server/renderer.ts';
 import {
   TRAINING_DATASET_PATH,
   getTrainingStats,
@@ -55,9 +56,20 @@ import {
   computeFinalRankScore,
   resetRankingWeights,
 } from './server/weights.ts';
+import {
+  clearCookiesFile,
+  ensureYtDlp,
+  getCookiesStatus,
+  saveCookiesContent,
+} from './server/ytdlp.ts';
 
 dotenv.config();
 ensureWorkspace();
+
+// Pre-warm standalone yt-dlp asynchronously in background so YouTube/Twitch/Kick links work immediately
+ensureYtDlp().catch(() => {
+  // Handled gracefully on demand in ingestFromUrl if offline at boot
+});
 
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
@@ -110,73 +122,120 @@ async function startServer() {
     }
   });
 
+  app.get('/api/ytdlp/cookies/status', (_req, res) => {
+    res.json(getCookiesStatus());
+  });
+
+  app.post('/api/ytdlp/cookies', (req, res) => {
+    try {
+      const raw = typeof req.body?.cookiesText === 'string' ? req.body.cookiesText : '';
+      const status = saveCookiesContent(raw);
+      res.json(status);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid cookie format' });
+    }
+  });
+
+  app.delete('/api/ytdlp/cookies', (_req, res) => {
+    clearCookiesFile();
+    res.json(getCookiesStatus());
+  });
+
+  app.get('/api/jobs/:id', (req, res) => {
+    const job = getJob(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job not found or expired' });
+    res.json({ job });
+  });
+
   app.get('/api/projects', (_req, res) => {
     res.json({ projects: listProjects() });
   });
 
-  app.post('/api/ingest/upload', upload.single('video'), async (req, res) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: 'Please choose a video file to upload.' });
-      }
-      const rawTitle = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
-      const transcriptText =
-        typeof req.body?.transcriptText === 'string' ? req.body.transcriptText : undefined;
-      const title =
-        rawTitle ||
-        path.basename(req.file.originalname, path.extname(req.file.originalname)) ||
-        'Uploaded Video';
-
-      const weights = loadWeights();
-      const project = await analyzeVideoProject({
-        fileName: req.file.filename,
-        title: title.slice(0, 120),
-        sourceType: 'local',
-        transcriptText,
-        weights,
-      });
-
-      saveProject(project);
-      res.status(201).json({ project });
-    } catch (err) {
-      if (req.file?.path && fs.existsSync(req.file.path)) {
-        try {
-          fs.unlinkSync(req.file.path);
-        } catch {
-          // ignore
-        }
-      }
-      res.status(400).json({ error: err instanceof Error ? err.message : 'Upload analysis failed' });
+  app.post('/api/ingest/upload', upload.single('video'), (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Please choose a video file to upload.' });
     }
+
+    const uploadedFile = req.file;
+    const rawTitle = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    const transcriptText =
+      typeof req.body?.transcriptText === 'string' ? req.body.transcriptText : undefined;
+    const title =
+      rawTitle ||
+      path.basename(uploadedFile.originalname, path.extname(uploadedFile.originalname)) ||
+      'Uploaded Video';
+
+    const job = createJob('ingest-upload', 'Analyzing uploaded video...', title.slice(0, 80));
+
+    (async () => {
+      try {
+        const weights = loadWeights();
+        const project = await analyzeVideoProject({
+          fileName: uploadedFile.filename,
+          title: title.slice(0, 120),
+          sourceType: 'local',
+          sourceMode: 'local',
+          transcriptText,
+          weights,
+          onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
+        });
+        saveProject(project);
+        completeJob(job.id, { project });
+      } catch (err) {
+        if (uploadedFile.path && fs.existsSync(uploadedFile.path)) {
+          try {
+            fs.unlinkSync(uploadedFile.path);
+          } catch {
+            // ignore
+          }
+        }
+        failJob(job.id, err instanceof Error ? err.message : 'Upload analysis failed');
+      }
+    })();
+
+    res.status(202).json({ jobId: job.id, job });
   });
 
-  app.post('/api/ingest/url', async (req, res) => {
-    try {
-      const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
-      const titleOverride = typeof req.body?.title === 'string' ? req.body.title.trim() : undefined;
-      const transcriptText =
-        typeof req.body?.transcriptText === 'string' ? req.body.transcriptText : undefined;
+  app.post('/api/ingest/url', (req, res) => {
+    const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    const titleOverride = typeof req.body?.title === 'string' ? req.body.title.trim() : undefined;
+    const transcriptText =
+      typeof req.body?.transcriptText === 'string' ? req.body.transcriptText : undefined;
 
-      if (!rawUrl) {
-        return res.status(400).json({ error: 'Video URL is required.' });
-      }
-
-      const ingested = await ingestFromUrl(rawUrl, titleOverride);
-      const weights = loadWeights();
-      const project = await analyzeVideoProject({
-        fileName: ingested.fileName,
-        title: ingested.title,
-        sourceType: ingested.platform,
-        sourceUrl: rawUrl,
-        transcriptText,
-        weights,
-      });
-
-      saveProject(project);
-      res.status(201).json({ project });
-    } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'URL ingest failed' });
+    if (!rawUrl) {
+      return res.status(400).json({ error: 'Video URL is required.' });
     }
+
+    const job = createJob('ingest-url', 'Connecting to remote stream...', rawUrl.slice(0, 80));
+
+    (async () => {
+      try {
+        const ingested = await ingestFromUrl(rawUrl, titleOverride, (pct, stage, detail) =>
+          updateJob(job.id, { progress: pct, stage, detail })
+        );
+        const weights = loadWeights();
+        const project = await analyzeVideoProject({
+          fileName: ingested.fileName,
+          title: ingested.title,
+          sourceType: ingested.platform,
+          sourceMode: ingested.sourceMode,
+          sourceUrl: rawUrl,
+          streamUrls: ingested.streamUrls,
+          preProbed: ingested.preProbed,
+          chapters: ingested.chapters,
+          heatmap: ingested.heatmap,
+          transcriptText,
+          weights,
+          onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
+        });
+        saveProject(project);
+        completeJob(job.id, { project });
+      } catch (err) {
+        failJob(job.id, err instanceof Error ? err.message : 'URL ingest failed');
+      }
+    })();
+
+    res.status(202).json({ jobId: job.id, job });
   });
 
   app.post('/api/ingest/sample', async (_req, res) => {
@@ -198,6 +257,7 @@ async function startServer() {
         fileName: sample.fileName,
         title: sample.title,
         sourceType: sample.platform,
+        sourceMode: 'local',
         transcriptText: sampleTranscript,
         weights,
       });
@@ -241,6 +301,41 @@ async function startServer() {
     }
   });
 
+  app.get('/api/projects/:id/moments/:momentId/preview', async (req, res) => {
+    try {
+      const project = getProject(req.params.id);
+      if (!project) return res.status(404).json({ error: 'Project not found' });
+
+      const moment = project.moments.find((m) => m.id === req.params.momentId);
+      if (!moment) return res.status(404).json({ error: 'Moment not found' });
+
+      const previewDur = Math.min(55, Math.max(15, moment.durationSec + 8));
+      const previewStart = Math.max(0, moment.startSec - 2);
+      const previewPath = await ensureRemotePreviewSegment(project, previewStart, previewDur);
+      res.sendFile(previewPath);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Could not prepare remote segment preview',
+      });
+    }
+  });
+
+  app.get('/api/projects/:id/preview-window', async (req, res) => {
+    try {
+      const project = getProject(req.params.id);
+      if (!project) return res.status(404).json({ error: 'Project not found' });
+
+      const startSec = Math.max(0, Number(req.query.start ?? 0));
+      const durSec = Math.min(60, Math.max(10, Number(req.query.dur ?? 45)));
+      const previewPath = await ensureRemotePreviewSegment(project, startSec, durSec);
+      res.sendFile(previewPath);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Could not prepare timestamp preview',
+      });
+    }
+  });
+
   app.post('/api/projects/:id/moments', (req, res) => {
     const project = getProject(req.params.id);
     if (!project) return res.status(404).json({ error: 'Project not found' });
@@ -255,10 +350,18 @@ async function startServer() {
         : `Manual Clip (${startSec.toFixed(1)}s – ${endSec.toFixed(1)}s)`;
 
     const slice = project.audioEnergySeries.filter((p) => p.sec >= startSec && p.sec <= endSec);
-    const peakDb = slice.length ? Math.max(...slice.map((p) => p.db)) : -18;
-    const avgNorm = slice.length
-      ? slice.reduce((a, b) => a + b.normalized, 0) / slice.length
-      : 0.65;
+    let peakDb = -18;
+    let avgNorm = 0.65;
+    if (slice.length > 0) {
+      peakDb = slice.reduce((acc, p) => (p.db > acc ? p.db : acc), slice[0].db);
+      avgNorm = slice.reduce((a, b) => a + b.normalized, 0) / slice.length;
+    } else if (project.audioEnergySeries.length > 0) {
+      const nearest = project.audioEnergySeries.reduce((best, p) =>
+        Math.abs(p.sec - startSec) < Math.abs(best.sec - startSec) ? p : best
+      );
+      peakDb = nearest.db;
+      avgNorm = nearest.normalized;
+    }
 
     const weights = loadWeights();
     const audioSpikeScore = Math.round(Math.min(0.99, Math.max(0.4, avgNorm + 0.15)) * 100) / 100;
@@ -345,13 +448,15 @@ async function startServer() {
     const project = getProject(req.params.id);
     if (!project) return res.status(404).json({ error: 'Project not found' });
 
-    try {
-      const srcPath = resolveSafeChildPath(SOURCES_DIR, project.fileName);
-      if (fs.existsSync(srcPath)) {
-        fs.unlinkSync(srcPath);
+    if (project.sourceMode !== 'remote-stream') {
+      try {
+        const srcPath = resolveSafeChildPath(SOURCES_DIR, project.fileName);
+        if (fs.existsSync(srcPath)) {
+          fs.unlinkSync(srcPath);
+        }
+      } catch {
+        return res.status(400).json({ error: 'Could not clean up source file safely.' });
       }
-    } catch {
-      return res.status(400).json({ error: 'Could not clean up source file safely.' });
     }
 
     const updated = saveProject({
@@ -432,50 +537,56 @@ async function startServer() {
     res.json({ clips: listClips() });
   });
 
-  app.post('/api/clips/render', async (req, res) => {
-    try {
-      const projectId = String(req.body?.projectId || '');
-      const momentId = String(req.body?.momentId || '');
-      const layoutId = (req.body?.layoutId || 'split-top-cam') as LayoutId;
-      const templateId = (req.body?.templateId || 'none') as TemplateId;
+  app.post('/api/clips/render', (req, res) => {
+    const projectId = String(req.body?.projectId || '');
+    const momentId = String(req.body?.momentId || '');
+    const layoutId = (req.body?.layoutId || 'split-top-cam') as LayoutId;
+    const templateId = (req.body?.templateId || 'none') as TemplateId;
 
-      const project = getProject(projectId);
-      if (!project) return res.status(404).json({ error: 'Project not found' });
+    const project = getProject(projectId);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
 
-      const moment = project.moments.find((m) => m.id === momentId) || project.moments[0];
-      if (!moment) return res.status(404).json({ error: 'Moment not found' });
+    const moment = project.moments.find((m) => m.id === momentId) || project.moments[0];
+    if (!moment) return res.status(404).json({ error: 'Moment not found' });
 
-      const facecamBox = (req.body?.facecamBox as FacecamBox) || project.detectedFacecam;
-      const branding: BrandingConfig = {
-        creditText: String(req.body?.branding?.creditText || '@clipforge').slice(0, 40),
-        backgroundHex: String(req.body?.branding?.backgroundHex || '#0B0D11').slice(0, 12),
-        watermarkText: String(req.body?.branding?.watermarkText || '').slice(0, 40),
-        outroEnabled: Boolean(req.body?.branding?.outroEnabled),
-        outroSeconds: Number(req.body?.branding?.outroSeconds || 1.5),
-        musicVolume: Number(req.body?.branding?.musicVolume ?? 0),
-        musicTrackId: req.body?.branding?.musicTrackId || null,
-      };
+    const facecamBox = (req.body?.facecamBox as FacecamBox) || project.detectedFacecam;
+    const branding: BrandingConfig = {
+      creditText: String(req.body?.branding?.creditText || '@clipforge').slice(0, 40),
+      backgroundHex: String(req.body?.branding?.backgroundHex || '#0B0D11').slice(0, 12),
+      watermarkText: String(req.body?.branding?.watermarkText || '').slice(0, 40),
+      outroEnabled: Boolean(req.body?.branding?.outroEnabled),
+      outroSeconds: Number(req.body?.branding?.outroSeconds || 1.5),
+      musicVolume: Number(req.body?.branding?.musicVolume ?? 0),
+      musicTrackId: req.body?.branding?.musicTrackId || null,
+    };
 
-      const clip = await renderVerticalClip({
-        project,
-        moment,
-        layoutId,
-        templateId,
-        facecamBox,
-        branding,
-        titleOverride: typeof req.body?.title === 'string' ? req.body.title : undefined,
-        hookTaglineOverride:
-          typeof req.body?.hookTagline === 'string' ? req.body.hookTagline : undefined,
-        descriptionOverride:
-          typeof req.body?.description === 'string' ? req.body.description : undefined,
-        hashtagsOverride: Array.isArray(req.body?.hashtags) ? req.body.hashtags : undefined,
-      });
+    const job = createJob('render', 'Starting 9:16 FFmpeg render...', moment.title);
 
-      saveClip(clip);
-      res.status(201).json({ clip });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'FFmpeg render failed' });
-    }
+    (async () => {
+      try {
+        const clip = await renderVerticalClip({
+          project,
+          moment,
+          layoutId,
+          templateId,
+          facecamBox,
+          branding,
+          titleOverride: typeof req.body?.title === 'string' ? req.body.title : undefined,
+          hookTaglineOverride:
+            typeof req.body?.hookTagline === 'string' ? req.body.hookTagline : undefined,
+          descriptionOverride:
+            typeof req.body?.description === 'string' ? req.body.description : undefined,
+          hashtagsOverride: Array.isArray(req.body?.hashtags) ? req.body.hashtags : undefined,
+          onProgress: (pct, stage, detail) => updateJob(job.id, { progress: pct, stage, detail }),
+        });
+        saveClip(clip);
+        completeJob(job.id, { clip });
+      } catch (err) {
+        failJob(job.id, err instanceof Error ? err.message : 'FFmpeg render failed');
+      }
+    })();
+
+    res.status(202).json({ jobId: job.id, job });
   });
 
   app.patch('/api/clips/:id', (req, res) => {

@@ -61,10 +61,23 @@ export interface ViralMoment {
   feedback?: 'up' | 'down' | null;
 }
 
+export interface VideoChapter {
+  startSec: number;
+  endSec: number;
+  title: string;
+}
+
+export interface HeatmapPoint {
+  startSec: number;
+  endSec: number;
+  value: number;
+}
+
 export interface VideoProject {
   id: string;
   title: string;
   sourceType: PlatformType;
+  sourceMode?: 'local' | 'remote-stream';
   sourceUrl?: string;
   fileName: string;
   sourceSizeBytes?: number;
@@ -79,6 +92,8 @@ export interface VideoProject {
   detectedFacecam: FacecamBox;
   facecamCandidates: FacecamBox[];
   moments: ViralMoment[];
+  chapters?: VideoChapter[];
+  heatmapPeaks?: HeatmapPoint[];
   transcriptText?: string;
   createdAt: string;
 }
@@ -175,6 +190,20 @@ export interface SystemCapabilities {
     models: string[];
   };
   workspaceReady: boolean;
+}
+
+export interface JobStatus {
+  id: string;
+  type: 'ingest-url' | 'ingest-upload' | 'render';
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  progress: number;
+  stage: string;
+  detail?: string;
+  error?: string;
+  project?: VideoProject;
+  clip?: RenderedClip;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface LayoutOptionMeta {
